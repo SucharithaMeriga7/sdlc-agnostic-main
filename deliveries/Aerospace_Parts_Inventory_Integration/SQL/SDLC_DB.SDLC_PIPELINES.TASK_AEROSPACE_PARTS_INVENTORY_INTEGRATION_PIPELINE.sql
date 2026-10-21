@@ -2,7 +2,7 @@
 -- Object        : SDLC_DB.SDLC_PIPELINES.TASK_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE
 -- Object Type   : TASK
 -- Jira Story    : SCRUM-158
--- Requirements  : FR-01, FR-02, FR-03, FR-04, FR-05, FR-06, FR-07, FR-08, FR-09, FR-10
+-- Requirements  : FR-01, FR-02, FR-03, FR-04, FR-05, FR-06, FR-07, FR-08, FR-09
 -- Reuse Route   : PIPELINE
 -- Description   : Schedules SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE
 -- Author        : Sucharitha
