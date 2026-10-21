@@ -1,0 +1,311 @@
+{
+  "main_topic": "Aerospace Parts Inventory Integration",
+  "executive_summary": "Build an automated daily Snowflake pipeline to ingest aerospace parts inventory data from a source database into a target database. The pipeline will apply SCD Type 1 overwrite, deduplication by latest UPDATED_AT, incremental loads, soft deletes, mandatory reconciliation logging, and data transformations including MANUFACTURER uppercasing, WEIGHT_KG cleansing, and a derived RISK_SCORE column. SLA target is 1 million records within 5 minutes.",
+  "business_objectives": [
+    "Automate daily ingestion of aerospace parts inventory data into Snowflake for reporting and analytics",
+    "Ensure data quality through deduplication, standardization, and cleansing transformations",
+    "Support compliance, procurement analysis, and operations with accurate, analytics-ready data",
+    "Achieve SLA of processing 1 million records within 5 minutes per run",
+    "Maintain full reconciliation audit trail per pipeline execution"
+  ],
+  "current_state": "Aerospace parts inventory data exists in a source system (AEROSPACE_PARTS_SOURCE) but lacks an automated, standardized pipeline to deliver clean, deduplicated, analytics-ready data to a target reporting environment.",
+  "future_state": "A scalable, automated Snowflake pipeline runs daily at 05:00 UTC, loading deduplicated, transformed, and reconciled aerospace parts data into AEROSPACE_PARTS_TARGET with full SLA compliance and reconciliation logging.",
+  "scope_in": [
+    "Incremental and full load pipeline from AEROSPACE_PARTS_SOURCE to AEROSPACE_PARTS_TARGET",
+    "SCD Type 1 (overwrite, no history) strategy keyed on PART_NUMBER",
+    "Deduplication logic retaining the latest record by UPDATED_AT",
+    "Soft delete handling: records missing from source marked as Decommissioned",
+    "MANUFACTURER field uppercasing transformation",
+    "WEIGHT_KG cleansing: replace values <= 0 with -1",
+    "Derived RISK_SCORE column calculation",
+    "Mandatory reconciliation logging to ETL_RECONCILIATION_LOG per run",
+    "Daily scheduling at 05:00 UTC",
+    "SLA enforcement: 1 million records within 5 minutes"
+  ],
+  "scope_out": [
+    "SCD Type 2 or historical change tracking",
+    "Real-time or near-real-time ingestion",
+    "Source system modifications or upstream data fixes",
+    "Transformation rules beyond those specified in the MOM"
+  ],
+  "functional_requirements": [
+    {
+      "id": "FR-01",
+      "text": "The pipeline must perform an incremental load using UPDATED_AT greater than the last successful execution timestamp. The first run must perform a full load.",
+      "priority": "Must",
+      "rule_ids": [
+        "BR-01",
+        "BR-02"
+      ]
+    },
+    {
+      "id": "FR-02",
+      "text": "The pipeline must deduplicate source records by PART_NUMBER, retaining only the latest record based on UPDATED_AT before loading into the target.",
+      "priority": "Must",
+      "rule_ids": [
+        "BR-03"
+      ]
+    },
+    {
+      "id": "FR-03",
+      "text": "The pipeline must implement SCD Type 1 strategy, overwriting existing target records matched by PART_NUMBER with no history retention.",
+      "priority": "Must",
+      "rule_ids": [
+        "BR-04"
+      ]
+    },
+    {
+      "id": "FR-04",
+      "text": "The pipeline must perform soft deletes: records present in the target but absent from the current source extract must have their status set to Decommissioned.",
+      "priority": "Must",
+      "rule_ids": [
+        "BR-05"
+      ]
+    },
+    {
+      "id": "FR-05",
+      "text": "The MANUFACTURER field must be converted to uppercase during transformation.",
+      "priority": "Must",
+      "rule_ids": [
+        "BR-06"
+      ]
+    },
+    {
+      "id": "FR-06",
+      "text": "The WEIGHT_KG field must be cleansed by replacing any value less than or equal to 0 with -1.",
+      "priority": "Must",
+      "rule_ids": [
+        "BR-07"
+      ]
+    },
+    {
+      "id": "FR-07",
+      "text": "A derived column RISK_SCORE must be calculated for each part record based on certification status and lead time according to defined business rules.",
+      "priority": "Must",
+      "rule_ids": [
+        "BR-08",
+        "BR-09",
+        "BR-10",
+        "BR-11"
+      ]
+    },
+    {
+      "id": "FR-08",
+      "text": "A mandatory reconciliation check must be performed after every pipeline run and results must be logged to ETL_RECONCILIATION_LOG.",
+      "priority": "Must",
+      "rule_ids": [
+        "BR-12"
+      ]
+    },
+    {
+      "id": "FR-09",
+      "text": "The pipeline must be scheduled to execute daily at 05:00 UTC.",
+      "priority": "Must",
+      "rule_ids": []
+    }
+  ],
+  "non_functional_requirements": [
+    {
+      "id": "NFR-01",
+      "text": "The pipeline must process up to 1 million records within 5 minutes to meet the defined SLA."
+    },
+    {
+      "id": "NFR-02",
+      "text": "The pipeline must be scalable to handle volume growth without architectural redesign."
+    },
+    {
+      "id": "NFR-03",
+      "text": "The pipeline must be automated with no manual intervention required for standard daily runs."
+    },
+    {
+      "id": "NFR-04",
+      "text": "All pipeline executions must produce auditable reconciliation logs for compliance purposes."
+    },
+    {
+      "id": "NFR-05",
+      "text": "The Snowflake warehouse must be provisioned and available prior to the 05:00 UTC scheduled execution window."
+    }
+  ],
+  "source_systems": [
+    "AEROSPACE_PARTS_SOURCE"
+  ],
+  "target_systems": [
+    "AEROSPACE_PARTS_TARGET",
+    "ETL_RECONCILIATION_LOG"
+  ],
+  "source_objects": [
+    "AEROSPACE_PARTS_SOURCE"
+  ],
+  "target_objects": [
+    "AEROSPACE_PARTS_TARGET",
+    "ETL_RECONCILIATION_LOG"
+  ],
+  "business_rules": [
+    {
+      "id": "BR-01",
+      "text": "Incremental load condition: extract records from source where UPDATED_AT is greater than the last successful execution timestamp."
+    },
+    {
+      "id": "BR-02",
+      "text": "On the first pipeline run (no prior execution timestamp exists), perform a full load of all source records."
+    },
+    {
+      "id": "BR-03",
+      "text": "When duplicate PART_NUMBER records exist in the source extract, retain only the record with the maximum UPDATED_AT value."
+    },
+    {
+      "id": "BR-04",
+      "text": "Apply SCD Type 1: match target records by PART_NUMBER and overwrite all non-key attributes with source values; do not retain historical versions."
+    },
+    {
+      "id": "BR-05",
+      "text": "Any PART_NUMBER present in the target but not present in the current source extract must be updated with status set to Decommissioned (soft delete)."
+    },
+    {
+      "id": "BR-06",
+      "text": "Transform MANUFACTURER field value to uppercase (e.g., UPPER(MANUFACTURER))."
+    },
+    {
+      "id": "BR-07",
+      "text": "If WEIGHT_KG is less than or equal to 0, replace the value with -1; otherwise retain the original value."
+    },
+    {
+      "id": "BR-08",
+      "text": "RISK_SCORE = 'High Risk' when certification status is Pending AND lead time exceeds 60 days."
+    },
+    {
+      "id": "BR-09",
+      "text": "RISK_SCORE = 'Medium Risk' when certification status is Pending OR lead time exceeds 100 days (and the High Risk condition is not met)."
+    },
+    {
+      "id": "BR-10",
+      "text": "RISK_SCORE = 'Low Risk' when certification status is one of FAA, EASA, or Dual AND lead time is 60 days or less."
+    },
+    {
+      "id": "BR-11",
+      "text": "RISK_SCORE = 'Medium Risk' for all cases not covered by BR-08, BR-09, or BR-10."
+    },
+    {
+      "id": "BR-12",
+      "text": "After every pipeline run, reconciliation results (source count, target count, inserted, updated, soft-deleted, discrepancies) must be logged to ETL_RECONCILIATION_LOG."
+    }
+  ],
+  "kpis": [
+    "Pipeline execution time: must process 1 million records within 5 minutes",
+    "Reconciliation pass rate: 100% of runs must produce a reconciliation log entry",
+    "Soft delete accuracy: all decommissioned parts correctly flagged per run",
+    "Deduplication rate: zero duplicate PART_NUMBER records in target post-load",
+    "Schedule adherence: pipeline executes daily at 05:00 UTC without manual intervention"
+  ],
+  "data_transformations": [
+    "Convert MANUFACTURER field to uppercase using UPPER() function",
+    "Replace WEIGHT_KG values less than or equal to 0 with -1",
+    "Derive RISK_SCORE column based on certification status and lead time business rules",
+    "Deduplicate source records by PART_NUMBER retaining maximum UPDATED_AT",
+    "Apply soft delete flag (Decommissioned) to target records absent from source extract"
+  ],
+  "calculated_columns": [
+    {
+      "name": "RISK_SCORE",
+      "logic": "CASE WHEN CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 60 THEN 'High Risk' WHEN (CERTIFICATION_STATUS = 'Pending' OR LEAD_TIME_DAYS > 100) THEN 'Medium Risk' WHEN CERTIFICATION_STATUS IN ('FAA', 'EASA', 'Dual') AND LEAD_TIME_DAYS <= 60 THEN 'Low Risk' ELSE 'Medium Risk' END"
+    }
+  ],
+  "filters": [
+    "Incremental load filter: UPDATED_AT > last_successful_execution_timestamp",
+    "Full load filter: no filter applied on first run (all source records extracted)"
+  ],
+  "dependencies": [
+    "Business Analyst must deliver the BRD before pipeline development begins",
+    "Architecture must validate Snowflake warehouse availability and scheduling configuration",
+    "All stakeholders must review and approve transformation rules before QA testing",
+    "QA must prepare test scenarios aligned to transformation and reconciliation rules",
+    "Snowflake warehouse must be provisioned prior to the 05:00 UTC daily schedule"
+  ],
+  "risks": [
+    "Invalid or unexpected certification values may break RISK_SCORE derivation logic",
+    "High data volumes may threaten the 5-minute SLA under peak conditions",
+    "Inconsistent or delayed source system updates may cause incremental processing gaps",
+    "Future business requirement changes may necessitate pipeline redesign",
+    "Warehouse provisioning or scheduling delays may cause missed execution windows"
+  ],
+  "assumptions": [
+    "PART_NUMBER is the unique business key in both source and target",
+    "UPDATED_AT is a reliable and consistently populated timestamp in the source system",
+    "The last successful execution timestamp is persisted and accessible by the pipeline at runtime",
+    "Valid certification status values are limited to: Pending, FAA, EASA, Dual (plus any others defaulting to Medium Risk)",
+    "The Snowflake warehouse will be available and sized appropriately to meet the 5-minute SLA",
+    "The first pipeline run with no prior execution timestamp will perform a full load"
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-01",
+      "text": "On the first run, all records from the source are loaded into the target with no UPDATED_AT filter applied.",
+      "requirement_id": "FR-01"
+    },
+    {
+      "id": "AC-02",
+      "text": "On subsequent runs, only records with UPDATED_AT greater than the last successful execution timestamp are extracted and processed.",
+      "requirement_id": "FR-01"
+    },
+    {
+      "id": "AC-03",
+      "text": "After each load, no duplicate PART_NUMBER values exist in AEROSPACE_PARTS_TARGET.",
+      "requirement_id": "FR-02"
+    },
+    {
+      "id": "AC-04",
+      "text": "When multiple source records share the same PART_NUMBER, only the record with the latest UPDATED_AT is loaded.",
+      "requirement_id": "FR-02"
+    },
+    {
+      "id": "AC-05",
+      "text": "Existing target records matched by PART_NUMBER are overwritten with source values; no historical versions are retained.",
+      "requirement_id": "FR-03"
+    },
+    {
+      "id": "AC-06",
+      "text": "All PART_NUMBER records present in the target but absent from the source extract have their status updated to Decommissioned.",
+      "requirement_id": "FR-04"
+    },
+    {
+      "id": "AC-07",
+      "text": "All MANUFACTURER values in AEROSPACE_PARTS_TARGET are stored in uppercase after each pipeline run.",
+      "requirement_id": "FR-05"
+    },
+    {
+      "id": "AC-08",
+      "text": "All WEIGHT_KG values less than or equal to 0 in the target are stored as -1 after transformation.",
+      "requirement_id": "FR-06"
+    },
+    {
+      "id": "AC-09",
+      "text": "RISK_SCORE is populated as 'High Risk' for all parts where CERTIFICATION_STATUS = 'Pending' and LEAD_TIME_DAYS > 60.",
+      "requirement_id": "FR-07"
+    },
+    {
+      "id": "AC-10",
+      "text": "RISK_SCORE is populated as 'Low Risk' for all parts where CERTIFICATION_STATUS is FAA, EASA, or Dual and LEAD_TIME_DAYS <= 60.",
+      "requirement_id": "FR-07"
+    },
+    {
+      "id": "AC-11",
+      "text": "RISK_SCORE is populated as 'Medium Risk' for all parts not meeting High Risk or Low Risk conditions.",
+      "requirement_id": "FR-07"
+    },
+    {
+      "id": "AC-12",
+      "text": "A reconciliation record is written to ETL_RECONCILIATION_LOG after every pipeline run, including source count, target count, and any discrepancies.",
+      "requirement_id": "FR-08"
+    },
+    {
+      "id": "AC-13",
+      "text": "The pipeline executes automatically at 05:00 UTC daily without manual intervention.",
+      "requirement_id": "FR-09"
+    },
+    {
+      "id": "AC-14",
+      "text": "A load of 1 million records completes within 5 minutes as measured from pipeline start to reconciliation log write.",
+      "requirement_id": "FR-09"
+    }
+  ]
+}
