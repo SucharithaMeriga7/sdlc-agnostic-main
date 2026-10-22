@@ -9,7 +9,7 @@
 -- Created Date  : 2026-10-22
 -- Dependencies  :
 --   - SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE
--- Business Rules: BR-01, BR-02, BR-03, BR-04, BR-05, BR-06, BR-07, BR-08, BR-09, BR-10, BR-11, BR-12
+-- Business Rules: BR-01, BR-02, BR-03, BR-04, BR-05, BR-06, BR-07, BR-08, BR-09, BR-10, BR-11, BR-12, BR-13
 -- Change History:
 --   2026-10-22  Sucharitha  SCRUM-158  Initial generation (PIPELINE)
 -- =============================================================================
