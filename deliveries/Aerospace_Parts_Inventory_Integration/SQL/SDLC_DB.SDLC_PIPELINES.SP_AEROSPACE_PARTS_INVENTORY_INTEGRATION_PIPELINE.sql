@@ -8,14 +8,12 @@
 -- Author        : Sucharitha
 -- Created Date  : 2026-10-22
 -- Dependencies  :
---   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET
---   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TRANSFORMED
---   - SDLC_DB.SDLC_PIPELINES.PIPELINE_EXECUTION_LOG
---   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_DEDUPLICATED
---   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET
---   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TRANSFORMED
---   - SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG
--- Business Rules: BR-01, BR-02, BR-03, BR-04, BR-05, BR-06, BR-07, BR-08, BR-09, BR-10, BR-11, BR-12, BR-13, BR-14
+--   - SDLC_DB.SDLC_PIPELINES.PIPELINE_EXECUTION_STATE
+--   - SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED
+--   - SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_TRANSFORMED_MANUFACTURER
+--   - SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_TRANSFORMED_WEIGHT
+--   - SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_RISK_SCORE
+-- Business Rules: BR-01, BR-02, BR-03, BR-04, BR-05, BR-06, BR-07, BR-08, BR-09, BR-10, BR-11, BR-12
 -- Change History:
 --   2026-10-22  Sucharitha  SCRUM-158  Initial generation (PIPELINE)
 -- =============================================================================
@@ -27,241 +25,326 @@ EXECUTE AS CALLER
 AS
 $$
 DECLARE
-    -- -------------------------------------------------------------------------
-    -- Variable declarations
-    -- -------------------------------------------------------------------------
-    v_pipeline_name     VARCHAR  DEFAULT 'SP_LOAD_AEROSPACE_PARTS_SCD1';
-    v_run_ts            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP();
-    v_last_run_ts       TIMESTAMP_NTZ DEFAULT NULL;
-    v_source_count      NUMBER   DEFAULT 0;
-    v_target_count      NUMBER   DEFAULT 0;
-    v_inserted          NUMBER   DEFAULT 0;
-    v_updated           NUMBER   DEFAULT 0;
-    v_soft_deleted      NUMBER   DEFAULT 0;
+    -- ----------------------------------------------------------------
+    -- Pipeline identity constant
+    -- ----------------------------------------------------------------
+    v_pipeline_name     VARCHAR  DEFAULT 'SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE';
+
+    -- ----------------------------------------------------------------
+    -- Incremental load state variables (FR-01 / BR-01 / BR-02)
+    -- ----------------------------------------------------------------
+    v_last_run_ts       TIMESTAMP_NTZ;
+    v_is_first_run      BOOLEAN  DEFAULT FALSE;
+    v_run_start_ts      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP();
+
+    -- ----------------------------------------------------------------
+    -- Row count accumulators (FR-08 / BR-12)
+    -- ----------------------------------------------------------------
+    v_source_count      NUMBER(38,0) DEFAULT 0;
+    v_target_count      NUMBER(38,0) DEFAULT 0;
+    v_inserted          NUMBER(38,0) DEFAULT 0;
+    v_updated           NUMBER(38,0) DEFAULT 0;
+    v_soft_deleted      NUMBER(38,0) DEFAULT 0;
+
+    -- ----------------------------------------------------------------
+    -- MERGE result capture variables
+    -- ----------------------------------------------------------------
+    v_merge_inserted    NUMBER(38,0) DEFAULT 0;
+    v_merge_updated     NUMBER(38,0) DEFAULT 0;
+
+    -- ----------------------------------------------------------------
+    -- Summary / error variables
+    -- ----------------------------------------------------------------
     v_summary           VARCHAR  DEFAULT '';
     v_err               VARCHAR  DEFAULT '';
-    sd_count            NUMBER   DEFAULT 0;
 
 BEGIN
-    -- =========================================================================
-    -- STEP 1: Resolve last successful execution timestamp (FR-01, BR-01, BR-02)
-    -- If no prior successful run exists, v_last_run_ts remains NULL -> full load.
-    -- =========================================================================
-    SELECT MAX(EXECUTION_TIMESTAMP)
-    INTO   :v_last_run_ts
-    FROM   SDLC_DB.SDLC_PIPELINES.PIPELINE_EXECUTION_LOG
-    WHERE  STATUS = 'SUCCESS'
-      AND  PIPELINE_NAME = :v_pipeline_name;
+    -- ================================================================
+    -- STEP 0: Ensure schema and required objects exist
+    -- ================================================================
+    -- Ensure target schema exists
+    CREATE SCHEMA IF NOT EXISTS SDLC_DB.AEROSPACE_PARTS_TARGET;
 
-    -- =========================================================================
-    -- STEP 2: Count source records for this extract window (FR-08, BR-14)
-    -- Uses AEROSPACE_PARTS_TRANSFORMED (which reads AEROSPACE_PARTS_DEDUPLICATED
-    -- which reads IDEA_2_DB.PUBLIC.AEROSPACE_PARTS_SOURCE).
-    -- BR-01: incremental filter on UPDATED_AT when v_last_run_ts is not NULL.
-    -- BR-02: full load when v_last_run_ts IS NULL.
-    -- BR-09 exclusion is already applied inside AEROSPACE_PARTS_TRANSFORMED.
-    -- =========================================================================
+    -- Ensure execution state table exists (idempotent)
+    CREATE TABLE IF NOT EXISTS SDLC_DB.SDLC_PIPELINES.PIPELINE_EXECUTION_STATE (
+        PIPELINE_NAME      VARCHAR(200)  NOT NULL,
+        LAST_SUCCESSFUL_TS TIMESTAMP_NTZ NOT NULL,
+        UPDATED_AT         TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+        CONSTRAINT PK_PIPELINE_EXECUTION_STATE PRIMARY KEY (PIPELINE_NAME)
+    );
+
+    -- Ensure target PARTS table exists (idempotent)
+    CREATE TABLE IF NOT EXISTS SDLC_DB.AEROSPACE_PARTS_TARGET.PARTS (
+        PART_NUMBER          VARCHAR(100)  NOT NULL,
+        PART_NAME            VARCHAR(255),
+        MANUFACTURER         VARCHAR(255),
+        CATEGORY             VARCHAR(100),
+        WEIGHT_KG            NUMBER(10,3),
+        LEAD_TIME_DAYS       NUMBER(38,0),
+        CERTIFICATION_STATUS VARCHAR(100),
+        LIFECYCLE_STATUS     VARCHAR(100),
+        INSTALLATION_DATE    DATE,
+        RISK_SCORE           VARCHAR(50),
+        UPDATED_AT           TIMESTAMP_NTZ,
+        LOAD_TIMESTAMP       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+        CONSTRAINT PK_PARTS PRIMARY KEY (PART_NUMBER)
+    );
+
+    -- Ensure reconciliation log table exists (idempotent)
+    CREATE TABLE IF NOT EXISTS SDLC_DB.AEROSPACE_PARTS_TARGET.ETL_RECONCILIATION_LOG (
+        LOG_ID             NUMBER AUTOINCREMENT PRIMARY KEY,
+        PIPELINE_NAME      VARCHAR(200)  NOT NULL,
+        RUN_TIMESTAMP      TIMESTAMP_NTZ NOT NULL,
+        SOURCE_COUNT       NUMBER(38,0)  NOT NULL,
+        TARGET_COUNT       NUMBER(38,0)  NOT NULL,
+        INSERTED_COUNT     NUMBER(38,0)  NOT NULL,
+        UPDATED_COUNT      NUMBER(38,0)  NOT NULL,
+        SOFT_DELETED_COUNT NUMBER(38,0)  NOT NULL,
+        STATUS             VARCHAR(50)   NOT NULL,
+        ERROR_MESSAGE      VARCHAR(2000)
+    );
+
+    -- ================================================================
+    -- STEP 1: Determine incremental vs full load (FR-01 / BR-01 / BR-02)
+    -- ================================================================
+    -- Attempt to retrieve last successful execution timestamp
+    -- from the dedicated execution state table.
+    -- If no row exists this is the first run -> full load (BR-02).
+    SELECT LAST_SUCCESSFUL_TS
+    INTO   :v_last_run_ts
+    FROM   SDLC_DB.SDLC_PIPELINES.PIPELINE_EXECUTION_STATE
+    WHERE  PIPELINE_NAME = :v_pipeline_name
+    LIMIT  1;
+
+    IF (v_last_run_ts IS NULL) THEN
+        -- BR-02: first run - set epoch so all records qualify
+        v_is_first_run := TRUE;
+        v_last_run_ts  := '1970-01-01 00:00:00'::TIMESTAMP_NTZ;
+    END IF;
+
+    -- ================================================================
+    -- STEP 2: Count source extract rows (FR-08 / BR-12)
+    -- ================================================================
+    -- Count deduplicated source rows that pass the incremental filter.
+    -- VW_AEROSPACE_PARTS_RISK_SCORE is the final transformation view
+    -- (chains dedup -> manufacturer -> weight -> risk_score).
+    -- BR-01: filter UPDATED_AT > last successful timestamp.
+    -- BR-02: on first run v_last_run_ts = epoch so all rows qualify.
     SELECT COUNT(*)
     INTO   :v_source_count
-    FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TRANSFORMED
-    WHERE  (:v_last_run_ts IS NULL)
-        OR (UPDATED_AT > :v_last_run_ts);
+    FROM   SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_RISK_SCORE
+    WHERE  UPDATED_AT > :v_last_run_ts;
 
-    -- =========================================================================
-    -- STEP 3: SCD Type 1 MERGE into AEROSPACE_PARTS_TARGET (FR-03, FR-05, FR-07)
-    -- Source: AEROSPACE_PARTS_TRANSFORMED (already deduplicated via
-    --         AEROSPACE_PARTS_DEDUPLICATED, transformed, and RISK_SCORE derived).
-    -- Join key: PART_NUMBER (BR-04).
-    -- WHEN MATCHED    -> overwrite all non-key columns (BR-04).
-    -- WHEN NOT MATCHED -> insert new row.
-    -- Incremental filter: UPDATED_AT > last run ts, or full load on first run.
-    -- =========================================================================
-    MERGE INTO SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET AS tgt
+    -- ================================================================
+    -- STEP 3: SCD Type 1 MERGE into target PARTS (FR-03 / BR-04)
+    --         with all transformations applied via view chain
+    --         (FR-05/BR-06, FR-06/BR-07, FR-07/BR-08..BR-11)
+    -- ================================================================
+    -- MERGE matches on PART_NUMBER (natural key).
+    -- WHEN MATCHED: overwrite all non-key columns (SCD Type 1 - BR-04).
+    -- WHEN NOT MATCHED: insert new record.
+    -- Source is filtered by incremental timestamp (BR-01 / BR-02).
+    MERGE INTO SDLC_DB.AEROSPACE_PARTS_TARGET.PARTS AS tgt
     USING (
-        -- Apply incremental window filter (BR-01 / BR-02)
+        -- Apply incremental filter over the fully-transformed view
+        -- (dedup BR-03, UPPER(MANUFACTURER) BR-06, WEIGHT_KG BR-07, RISK_SCORE BR-08..BR-11)
         SELECT
             PART_NUMBER,
             PART_NAME,
-            MANUFACTURER,       -- Already UPPER (BR-06)
+            MANUFACTURER,       -- already UPPER() from VW_AEROSPACE_PARTS_TRANSFORMED_MANUFACTURER
             CATEGORY,
-            WEIGHT_KG,          -- NULL when <= 0 (BR-07)
-            UNIT_PRICE_USD,     -- Rounded to 2dp (BR-08)
-            QUANTITY_ON_HAND,
-            REORDER_LEVEL,
-            LIFECYCLE_STATUS,
-            CERTIFICATION_STATUS,
-            INSTALLATION_DATE,
+            WEIGHT_KG,          -- already -1 for <= 0 from VW_AEROSPACE_PARTS_TRANSFORMED_WEIGHT
             LEAD_TIME_DAYS,
-            SUPPLIER,
-            WAREHOUSE_LOCATION,
-            COUNTRY_OF_ORIGIN,
-            CREATED_AT,
-            UPDATED_AT,
-            RISK_SCORE          -- Derived per BR-10..BR-13
-        FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TRANSFORMED
-        WHERE (:v_last_run_ts IS NULL)
-           OR (UPDATED_AT > :v_last_run_ts)
+            CERTIFICATION_STATUS,
+            LIFECYCLE_STATUS,
+            INSTALLATION_DATE,
+            RISK_SCORE,         -- derived per BR-08..BR-11
+            UPDATED_AT
+        FROM SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_RISK_SCORE
+        WHERE UPDATED_AT > :v_last_run_ts  -- BR-01 incremental filter
     ) AS src
-    ON tgt.PART_NUMBER = src.PART_NUMBER
-
-    -- BR-04: SCD Type 1 overwrite on match
+    ON tgt.PART_NUMBER = src.PART_NUMBER   -- join on natural key
+    -- BR-04: SCD Type 1 - overwrite all non-key columns on match
     WHEN MATCHED THEN UPDATE SET
-        tgt.PART_NAME           = src.PART_NAME,
-        tgt.MANUFACTURER        = src.MANUFACTURER,
-        tgt.CATEGORY            = src.CATEGORY,
-        tgt.WEIGHT_KG           = src.WEIGHT_KG,
-        tgt.UNIT_PRICE_USD      = src.UNIT_PRICE_USD,
-        tgt.QUANTITY_ON_HAND    = src.QUANTITY_ON_HAND,
-        tgt.REORDER_LEVEL       = src.REORDER_LEVEL,
-        tgt.LIFECYCLE_STATUS    = src.LIFECYCLE_STATUS,
+        tgt.PART_NAME            = src.PART_NAME,
+        tgt.MANUFACTURER         = src.MANUFACTURER,
+        tgt.CATEGORY             = src.CATEGORY,
+        tgt.WEIGHT_KG            = src.WEIGHT_KG,
+        tgt.LEAD_TIME_DAYS       = src.LEAD_TIME_DAYS,
         tgt.CERTIFICATION_STATUS = src.CERTIFICATION_STATUS,
-        tgt.INSTALLATION_DATE   = src.INSTALLATION_DATE,
-        tgt.LEAD_TIME_DAYS      = src.LEAD_TIME_DAYS,
-        tgt.SUPPLIER            = src.SUPPLIER,
-        tgt.WAREHOUSE_LOCATION  = src.WAREHOUSE_LOCATION,
-        tgt.COUNTRY_OF_ORIGIN   = src.COUNTRY_OF_ORIGIN,
-        tgt.CREATED_AT          = src.CREATED_AT,
-        tgt.UPDATED_AT          = src.UPDATED_AT,
-        tgt.RISK_SCORE          = src.RISK_SCORE,
-        tgt.DW_UPDATE_TS        = CURRENT_TIMESTAMP()
-
-    -- New record: insert
+        tgt.LIFECYCLE_STATUS     = src.LIFECYCLE_STATUS,
+        tgt.INSTALLATION_DATE    = src.INSTALLATION_DATE,
+        tgt.RISK_SCORE           = src.RISK_SCORE,
+        tgt.UPDATED_AT           = src.UPDATED_AT,
+        tgt.LOAD_TIMESTAMP       = CURRENT_TIMESTAMP()
+    -- New PART_NUMBER not yet in target
     WHEN NOT MATCHED THEN INSERT (
-        PART_NUMBER, PART_NAME, MANUFACTURER, CATEGORY,
-        WEIGHT_KG, UNIT_PRICE_USD, QUANTITY_ON_HAND, REORDER_LEVEL,
-        LIFECYCLE_STATUS, CERTIFICATION_STATUS, INSTALLATION_DATE,
-        LEAD_TIME_DAYS, SUPPLIER, WAREHOUSE_LOCATION, COUNTRY_OF_ORIGIN,
-        CREATED_AT, UPDATED_AT, RISK_SCORE, DW_INSERT_TS, DW_UPDATE_TS
+        PART_NUMBER,
+        PART_NAME,
+        MANUFACTURER,
+        CATEGORY,
+        WEIGHT_KG,
+        LEAD_TIME_DAYS,
+        CERTIFICATION_STATUS,
+        LIFECYCLE_STATUS,
+        INSTALLATION_DATE,
+        RISK_SCORE,
+        UPDATED_AT,
+        LOAD_TIMESTAMP
     ) VALUES (
-        src.PART_NUMBER, src.PART_NAME, src.MANUFACTURER, src.CATEGORY,
-        src.WEIGHT_KG, src.UNIT_PRICE_USD, src.QUANTITY_ON_HAND, src.REORDER_LEVEL,
-        src.LIFECYCLE_STATUS, src.CERTIFICATION_STATUS, src.INSTALLATION_DATE,
-        src.LEAD_TIME_DAYS, src.SUPPLIER, src.WAREHOUSE_LOCATION, src.COUNTRY_OF_ORIGIN,
-        src.CREATED_AT, src.UPDATED_AT, src.RISK_SCORE, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+        src.PART_NUMBER,
+        src.PART_NAME,
+        src.MANUFACTURER,
+        src.CATEGORY,
+        src.WEIGHT_KG,
+        src.LEAD_TIME_DAYS,
+        src.CERTIFICATION_STATUS,
+        src.LIFECYCLE_STATUS,
+        src.INSTALLATION_DATE,
+        src.RISK_SCORE,
+        src.UPDATED_AT,
+        CURRENT_TIMESTAMP()
     );
 
     -- Capture MERGE row counts from result scan
+    -- Only WHEN NOT MATCHED (insert) and WHEN MATCHED (update) clauses present
     SELECT
         "number of rows inserted",
         "number of rows updated"
-    INTO :v_inserted, :v_updated
+    INTO
+        :v_merge_inserted,
+        :v_merge_updated
     FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
 
-    -- =========================================================================
-    -- STEP 4: Soft-delete records missing from current source extract (FR-04, BR-05)
-    -- Any PART_NUMBER in target that does NOT appear in the full current
-    -- AEROSPACE_PARTS_TRANSFORMED view (no incremental filter - we need the
-    -- complete current picture to identify truly missing keys) gets
-    -- LIFECYCLE_STATUS set to 'Decommissioned'.
-    -- =========================================================================
-    UPDATE SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET AS tgt
+    v_inserted := v_merge_inserted;
+    v_updated  := v_merge_updated;
+
+    -- ================================================================
+    -- STEP 4: Soft delete - mark Decommissioned (FR-04 / BR-05)
+    -- ================================================================
+    -- Identify PART_NUMBERs present in target but absent from the
+    -- FULL current source extract (not just the incremental slice).
+    -- VW_AEROSPACE_PARTS_DEDUPLICATED covers all source records.
+    -- BR-05: set LIFECYCLE_STATUS = 'Decommissioned' for missing parts.
+    UPDATE SDLC_DB.AEROSPACE_PARTS_TARGET.PARTS AS tgt
     SET
-        tgt.LIFECYCLE_STATUS = 'Decommissioned',  -- BR-05
-        tgt.DW_UPDATE_TS     = CURRENT_TIMESTAMP()
-    WHERE tgt.LIFECYCLE_STATUS <> 'Decommissioned'  -- Avoid redundant updates
-      AND tgt.PART_NUMBER NOT IN (
-            -- Full current source extract (all records passing BR-09 filter)
-            SELECT PART_NUMBER
-            FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TRANSFORMED
-      );
+        tgt.LIFECYCLE_STATUS = 'Decommissioned',
+        tgt.LOAD_TIMESTAMP   = CURRENT_TIMESTAMP()
+    WHERE tgt.PART_NUMBER NOT IN (
+        -- Full source extract (all PART_NUMBERs currently in source)
+        SELECT PART_NUMBER
+        FROM   SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED
+    )
+    -- Only update rows not already Decommissioned to avoid unnecessary writes
+    AND tgt.LIFECYCLE_STATUS <> 'Decommissioned';
 
-    -- Capture soft-delete count
-    sd_count := SQLROWCOUNT;
-    v_soft_deleted := :sd_count;
+    -- Capture soft-delete count via SQLROWCOUNT
+    v_soft_deleted := SQLROWCOUNT;
 
-    -- =========================================================================
-    -- STEP 5: Count target rows after load (FR-08, BR-14)
-    -- =========================================================================
+    -- ================================================================
+    -- STEP 5: Count target rows after load (FR-08 / BR-12)
+    -- ================================================================
     SELECT COUNT(*)
     INTO   :v_target_count
-    FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET;
+    FROM   SDLC_DB.AEROSPACE_PARTS_TARGET.PARTS;
 
-    -- =========================================================================
-    -- STEP 6: Log successful execution to PIPELINE_EXECUTION_LOG (FR-01)
-    -- Records the run timestamp so the next incremental load can use it.
-    -- =========================================================================
-    INSERT INTO SDLC_DB.SDLC_PIPELINES.PIPELINE_EXECUTION_LOG (
+    -- ================================================================
+    -- STEP 6: Update execution state (FR-01)
+    -- ================================================================
+    -- Record the run start timestamp as the new last successful TS.
+    -- Using run_start_ts (captured before load) ensures no records
+    -- written during this run are missed on the next incremental load.
+    MERGE INTO SDLC_DB.SDLC_PIPELINES.PIPELINE_EXECUTION_STATE AS st
+    USING (SELECT :v_pipeline_name AS PIPELINE_NAME) AS src
+    ON st.PIPELINE_NAME = src.PIPELINE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        st.LAST_SUCCESSFUL_TS = :v_run_start_ts,
+        st.UPDATED_AT         = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN INSERT (
         PIPELINE_NAME,
-        EXECUTION_TIMESTAMP,
-        STATUS
+        LAST_SUCCESSFUL_TS,
+        UPDATED_AT
     ) VALUES (
         :v_pipeline_name,
-        :v_run_ts,
-        'SUCCESS'
+        :v_run_start_ts,
+        CURRENT_TIMESTAMP()
     );
 
-    -- =========================================================================
-    -- STEP 7: Write reconciliation record (FR-08, BR-14)
-    -- Logs source count, target count, inserted, updated, soft-deleted.
-    -- Column names corrected to match ETL_RECONCILIATION_LOG DDL:
-    --   INSERTED_COUNT -> ROWS_INSERTED
-    --   UPDATED_COUNT  -> ROWS_UPDATED
-    --   SOFT_DELETED_COUNT -> ROWS_SOFT_DELETED
-    -- =========================================================================
-    INSERT INTO SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG (
-        RUN_TIMESTAMP,
+    -- ================================================================
+    -- STEP 7: Log reconciliation metrics (FR-08 / BR-12)
+    -- ================================================================
+    -- BR-12: must be logged on every pipeline run without exception.
+    INSERT INTO SDLC_DB.AEROSPACE_PARTS_TARGET.ETL_RECONCILIATION_LOG (
         PIPELINE_NAME,
+        RUN_TIMESTAMP,
         SOURCE_COUNT,
         TARGET_COUNT,
-        ROWS_INSERTED,
-        ROWS_UPDATED,
-        ROWS_SOFT_DELETED,
+        INSERTED_COUNT,
+        UPDATED_COUNT,
+        SOFT_DELETED_COUNT,
         STATUS,
-        NOTES
+        ERROR_MESSAGE
     ) VALUES (
-        :v_run_ts,
         :v_pipeline_name,
+        :v_run_start_ts,
         :v_source_count,
         :v_target_count,
         :v_inserted,
         :v_updated,
         :v_soft_deleted,
         'SUCCESS',
-        'Pipeline completed successfully. Last run ts used: ' || COALESCE(TO_VARCHAR(:v_last_run_ts), 'FULL LOAD')
+        NULL
     );
 
-    -- =========================================================================
-    -- STEP 8: Build and return summary string (FR-09)
-    -- =========================================================================
-    v_summary := 'SP_LOAD_AEROSPACE_PARTS_SCD1 completed. '
-              || 'Source rows: '       || :v_source_count    || ', '
-              || 'Inserted: '          || :v_inserted        || ', '
-              || 'Updated: '           || :v_updated         || ', '
-              || 'Soft-deleted: '      || :v_soft_deleted    || ', '
-              || 'Target total: '      || :v_target_count    || '. '
-              || 'Run ts: '            || TO_VARCHAR(:v_run_ts);
+    -- ================================================================
+    -- STEP 8: Build and return summary string
+    -- ================================================================
+    -- FR-09 note: A TASK named TK_AEROSPACE_PARTS_DAILY should be
+    -- created externally (outside this procedure) scheduled at
+    -- 05:00 UTC daily calling this procedure. Tasks are never
+    -- created inside procedures per delivery rules.
+    v_summary := 'SUCCESS | pipeline=' || :v_pipeline_name
+        || ' | first_run=' || :v_is_first_run::VARCHAR
+        || ' | last_run_ts=' || :v_last_run_ts::VARCHAR
+        || ' | source_count=' || :v_source_count::VARCHAR
+        || ' | inserted=' || :v_inserted::VARCHAR
+        || ' | updated=' || :v_updated::VARCHAR
+        || ' | soft_deleted=' || :v_soft_deleted::VARCHAR
+        || ' | target_count=' || :v_target_count::VARCHAR
+        || ' | run_ts=' || :v_run_start_ts::VARCHAR;
 
     RETURN :v_summary;
 
 EXCEPTION
     WHEN OTHER THEN
-        -- Capture error details before any DML
+    LET sdlc_code VARCHAR := SQLCODE;
+        -- Capture error details before any DML (SQLERRM only valid in expression)
         LET err VARCHAR := SQLERRM;
-        LET err_code VARCHAR := TO_VARCHAR(SQLCODE);
+        LET err_code VARCHAR := SQLCODE::VARCHAR;
 
-        -- Attempt to log the failure to the reconciliation log
-        INSERT INTO SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG (
-            RUN_TIMESTAMP,
+        -- BR-12: log failure to reconciliation log unconditionally
+        INSERT INTO SDLC_DB.AEROSPACE_PARTS_TARGET.ETL_RECONCILIATION_LOG (
             PIPELINE_NAME,
+            RUN_TIMESTAMP,
             SOURCE_COUNT,
             TARGET_COUNT,
-            ROWS_INSERTED,
-            ROWS_UPDATED,
-            ROWS_SOFT_DELETED,
+            INSERTED_COUNT,
+            UPDATED_COUNT,
+            SOFT_DELETED_COUNT,
             STATUS,
-            NOTES
+            ERROR_MESSAGE
         ) VALUES (
-            :v_run_ts,
             :v_pipeline_name,
+            :v_run_start_ts,
             :v_source_count,
             :v_target_count,
             :v_inserted,
             :v_updated,
             :v_soft_deleted,
             'FAILED',
-            'Error code: ' || :err_code || ' | Message: ' || :err
+            ':sdlc_code=' || :err_code || ' | ' || :err
         );
 
-        RETURN 'FAILED: ' || :err;
+        RETURN 'FAILED: SQLCODE=' || :err_code || ' | ' || :err;
 END;
 $$;
