@@ -9,10 +9,8 @@
 -- Created Date  : 2026-10-23
 -- Dependencies  :
 --   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS
---   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_STAGING
 --   - SDLC_DB.SDLC_PIPELINES.PIPELINE_METADATA
 --   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_DEDUPLICATED
---   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS
 --   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TRANSFORMED
 --   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_CLEANSED
 --   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_RISK_SCORED
@@ -29,79 +27,73 @@ EXECUTE AS CALLER
 AS
 $$
 DECLARE
+    -- ----------------------------------------------------------------
+    -- Variable declarations
+    -- ----------------------------------------------------------------
     v_pipeline_name     VARCHAR  DEFAULT 'AEROSPACE_PARTS_INVENTORY_INTEGRATION';
-    v_last_run_ts       TIMESTAMP_NTZ(9);
-    v_run_ts            TIMESTAMP_NTZ(9);
-    v_source_count      NUMBER(38,0) DEFAULT 0;
-    v_target_count      NUMBER(38,0) DEFAULT 0;
-    v_ins               NUMBER(38,0) DEFAULT 0;
-    v_upd               NUMBER(38,0) DEFAULT 0;
-    v_soft_del          NUMBER(38,0) DEFAULT 0;
-    v_target_rows       NUMBER(38,0) DEFAULT 0;
-    v_summary           VARCHAR      DEFAULT '';
-    err                 VARCHAR;
+    v_run_ts            TIMESTAMP_NTZ DEFAULT CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ;
+    v_last_run_ts       TIMESTAMP_NTZ DEFAULT NULL;
+    v_has_prior_run     BOOLEAN  DEFAULT FALSE;
+
+    -- Row count variables
+    v_source_count      NUMBER   DEFAULT 0;
+    v_target_count      NUMBER   DEFAULT 0;
+    v_ins               NUMBER   DEFAULT 0;
+    v_upd               NUMBER   DEFAULT 0;
+    v_soft_del          NUMBER   DEFAULT 0;
+
+    -- SLA tracking
+    v_start_ts          TIMESTAMP_NTZ DEFAULT CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ;
+    v_end_ts            TIMESTAMP_NTZ DEFAULT NULL;
+    v_elapsed_sec       NUMBER   DEFAULT 0;
+    v_sla_note          VARCHAR  DEFAULT '';
+
+    -- Summary
+    v_summary           VARCHAR  DEFAULT '';
+
+    -- Error capture
+    v_err               VARCHAR  DEFAULT '';
+
 BEGIN
     -- ================================================================
-    -- STEP 0: Capture run timestamp
+    -- STEP 1: Retrieve last successful run timestamp (FR-01, BR-01, BR-02)
     -- ================================================================
-    v_run_ts := CURRENT_TIMESTAMP();
+    -- Read the most recent SUCCESS timestamp from PIPELINE_METADATA.
+    -- If no row exists this is the first run -> full load (BR-02).
+    SELECT
+        LAST_RUN_TIMESTAMP,
+        TRUE
+    INTO
+        :v_last_run_ts,
+        :v_has_prior_run
+    FROM SDLC_DB.SDLC_PIPELINES.PIPELINE_METADATA
+    WHERE PIPELINE_NAME = :v_pipeline_name
+      AND LAST_RUN_STATUS = 'SUCCESS'
+    ORDER BY LAST_RUN_TIMESTAMP DESC NULLS LAST
+    LIMIT 1;
 
     -- ================================================================
-    -- STEP 1: Read last SUCCESSFUL run timestamp from PIPELINE_METADATA
-    --         BR-01 / BR-02: NULL => full load
-    --         Guard: if target table is empty, force full load regardless
-    --         of metadata (handles test-harness resets where metadata
-    --         was not cleared between test cycles).
+    -- STEP 2: Populate AEROSPACE_PARTS_DEDUPLICATED from raw source
+    -- (FR-02, BR-03) - deduplicate keeping latest record per PART_NUMBER
     -- ================================================================
-    SELECT MAX(LAST_RUN_TIMESTAMP)
-    INTO   :v_last_run_ts
-    FROM   SDLC_DB.SDLC_PIPELINES.PIPELINE_METADATA
-    WHERE  PIPELINE_NAME   = :v_pipeline_name
-      AND  LAST_RUN_STATUS = 'SUCCESS';
+    -- Full replace of deduplicated staging table each run so that
+    -- soft-delete detection in STEP 5 always reflects the complete
+    -- current source universe.
+    TRUNCATE TABLE SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_DEDUPLICATED;
 
-    -- If target is empty, treat as full load regardless of watermark
-    SELECT COUNT(*)
-    INTO   :v_target_rows
-    FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS;
-
-    IF (v_target_rows = 0) THEN
-        v_last_run_ts := NULL;
-    END IF;
-
-    -- ================================================================
-    -- STEP 2: Populate staging with deduplicated, transformed,
-    --         cleansed, risk-scored records (BR-03/06/07/08-11)
-    -- ================================================================
-    TRUNCATE TABLE SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_STAGING;
-
-    INSERT INTO SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_STAGING (
-        PART_NUMBER,
-        PART_NAME,
-        MANUFACTURER,
-        CATEGORY,
-        WEIGHT_KG,
-        UNIT_PRICE_USD,
-        QUANTITY_ON_HAND,
-        REORDER_LEVEL,
-        LIFECYCLE_STATUS,
-        CERTIFICATION_STATUS,
-        INSTALLATION_DATE,
-        LEAD_TIME_DAYS,
-        SUPPLIER,
-        WAREHOUSE_LOCATION,
-        COUNTRY_OF_ORIGIN,
-        CREATED_AT,
-        UPDATED_AT,
-        RISK_SCORE
+    INSERT INTO SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_DEDUPLICATED (
+        PART_NUMBER, PART_NAME, MANUFACTURER, CATEGORY,
+        WEIGHT_KG, UNIT_PRICE_USD, QUANTITY_ON_HAND, REORDER_LEVEL,
+        LIFECYCLE_STATUS, CERTIFICATION_STATUS, INSTALLATION_DATE,
+        LEAD_TIME_DAYS, SUPPLIER, WAREHOUSE_LOCATION, COUNTRY_OF_ORIGIN,
+        CREATED_AT, UPDATED_AT
     )
     SELECT
         PART_NUMBER,
         PART_NAME,
-        UPPER(MANUFACTURER)                                              AS MANUFACTURER,  -- BR-06
+        UPPER(MANUFACTURER)  AS MANUFACTURER,   -- BR-06: normalise to upper case
         CATEGORY,
-        -- BR-07: replace WEIGHT_KG <= 0 with -1; NULL is NOT <= 0, left as-is
-        IFF(WEIGHT_KG IS NOT NULL AND WEIGHT_KG <= 0,
-            CAST(-1 AS NUMBER(10,3)), WEIGHT_KG)                         AS WEIGHT_KG,
+        CASE WHEN WEIGHT_KG < 0 THEN NULL ELSE WEIGHT_KG END AS WEIGHT_KG,  -- BR-07: cleanse negative weights
         UNIT_PRICE_USD,
         QUANTITY_ON_HAND,
         REORDER_LEVEL,
@@ -113,93 +105,28 @@ BEGIN
         WAREHOUSE_LOCATION,
         COUNTRY_OF_ORIGIN,
         CREATED_AT,
-        UPDATED_AT,
-        -- Risk scoring BR-08 to BR-11
-        -- BR-08 High Risk: Pending AND LEAD_TIME_DAYS > 100
-        --   (PN-004 load1=61->High per FACTS; re-check: PN-004 Pending+61->High,
-        --    PN-021 Pending+65->High, PN-012 Pending+120->High,
-        --    PN-009 Pending+100->Medium per FACTS => threshold is strictly > 100
-        --    BUT PN-004 at 61 and PN-021 at 65 are also High Risk per FACTS.
-        --    Reconciling: High Risk = Pending AND (LEAD_TIME_DAYS > 100 OR
-        --    (LEAD_TIME_DAYS > 60 AND LEAD_TIME_DAYS < 100 is ambiguous)).
-        --    FACTS authoritative list: High=PN-004(Pending,61), PN-012(Pending,120),
-        --    PN-021(Pending,65); Medium=PN-009(Pending,100).
-        --    Pattern: High when Pending AND LEAD_TIME_DAYS > 60 EXCEPT when
-        --    LEAD_TIME_DAYS = 100 exactly? No — PN-009 has 100 days.
-        --    Correct rule: High Risk = Pending AND LEAD_TIME_DAYS > 60
-        --    AND LEAD_TIME_DAYS != 100; but that is arbitrary.
-        --    Simplest rule consistent with ALL facts:
-        --    High Risk = Pending AND LEAD_TIME_DAYS > 60 AND LEAD_TIME_DAYS <> 100
-        --    is still arbitrary. Re-read BR-09: "Pending AND lead time NOT >60".
-        --    PN-009 Pending+100: 100 > 60 is true, yet FACTS say Medium.
-        --    Only consistent interpretation: High Risk threshold is > 100 (strictly),
-        --    and PN-004(61) and PN-021(65) must be Medium, not High.
-        --    But FACTS explicitly say PN-004 load1 -> High Risk.
-        --    Final resolution from FACTS list:
-        --    High: PN-004(Pending,61), PN-012(Pending,120), PN-021(Pending,65)
-        --    Medium: PN-009(Pending,100)
-        --    => High Risk = Pending AND LEAD_TIME_DAYS > 60 AND LEAD_TIME_DAYS <> 100
-        --    This is the only rule that fits all stated facts exactly.
-        CASE
-            WHEN CERTIFICATION_STATUS = 'Pending'
-                 AND LEAD_TIME_DAYS > 60
-                 AND LEAD_TIME_DAYS <> 100                               THEN 'High Risk'   -- BR-08
-            WHEN CERTIFICATION_STATUS = 'Pending' OR LEAD_TIME_DAYS > 100 THEN 'Medium Risk' -- BR-09
-            WHEN CERTIFICATION_STATUS IN ('FAA','EASA','Dual')
-                 AND LEAD_TIME_DAYS <= 60                                THEN 'Low Risk'    -- BR-10
-            ELSE 'Medium Risk'                                                              -- BR-11
-        END AS RISK_SCORE
-    FROM IDEA_2_DB.PUBLIC.AEROSPACE_PARTS_SOURCE
-    WHERE (:v_last_run_ts IS NULL OR UPDATED_AT > :v_last_run_ts)  -- BR-01 / BR-02
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY PART_NUMBER
-        ORDER BY UPDATED_AT DESC NULLS LAST
-    ) = 1;  -- BR-03: keep latest row per PART_NUMBER
-
-    v_source_count := SQLROWCOUNT;
+        UPDATED_AT
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY PART_NUMBER ORDER BY UPDATED_AT DESC NULLS LAST) AS rn
+        FROM IDEA_2_DB.PUBLIC.AEROSPACE_PARTS_SOURCE
+    ) deduped
+    WHERE rn = 1;
 
     -- ================================================================
-    -- Guard: if nothing was staged, skip all DML and return early
-    --        without writing a log record (prevents phantom log rows
-    --        from empty test-harness runs).
+    -- STEP 3: Populate AEROSPACE_PARTS_RISK_SCORED from deduplicated
+    -- (FR-02, BR-08..BR-11) - derive RISK_SCORE
     -- ================================================================
-    IF (v_source_count = 0) THEN
-        v_summary :=
-            'Pipeline: '     || :v_pipeline_name
-            || ' | Run: '    || TO_VARCHAR(:v_run_ts)
-            || ' | Staged: 0 | Inserted: 0 | Updated: 0'
-            || ' | SoftDeleted: 0 | TargetActive:0 | Status: SKIPPED (no source rows)';
-        RETURN :v_summary;
-    END IF;
+    TRUNCATE TABLE SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_RISK_SCORED;
 
-    -- ================================================================
-    -- STEP 3: SCD Type 1 MERGE into target (BR-04)
-    -- ================================================================
-    MERGE INTO SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS AS tgt
-    USING SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_STAGING AS src
-        ON tgt.PART_NUMBER = src.PART_NUMBER
-    -- BR-04: overwrite all non-key attributes
-    WHEN MATCHED THEN UPDATE SET
-        tgt.PART_NAME            = src.PART_NAME,
-        tgt.MANUFACTURER         = src.MANUFACTURER,
-        tgt.CATEGORY             = src.CATEGORY,
-        tgt.WEIGHT_KG            = src.WEIGHT_KG,
-        tgt.UNIT_PRICE_USD       = src.UNIT_PRICE_USD,
-        tgt.QUANTITY_ON_HAND     = src.QUANTITY_ON_HAND,
-        tgt.REORDER_LEVEL        = src.REORDER_LEVEL,
-        tgt.LIFECYCLE_STATUS     = src.LIFECYCLE_STATUS,
-        tgt.CERTIFICATION_STATUS = src.CERTIFICATION_STATUS,
-        tgt.INSTALLATION_DATE    = src.INSTALLATION_DATE,
-        tgt.LEAD_TIME_DAYS       = src.LEAD_TIME_DAYS,
-        tgt.SUPPLIER             = src.SUPPLIER,
-        tgt.WAREHOUSE_LOCATION   = src.WAREHOUSE_LOCATION,
-        tgt.COUNTRY_OF_ORIGIN    = src.COUNTRY_OF_ORIGIN,
-        tgt.CREATED_AT           = src.CREATED_AT,
-        tgt.UPDATED_AT           = src.UPDATED_AT,
-        tgt.RISK_SCORE           = src.RISK_SCORE,
-        tgt.STATUS               = 'Active',
-        tgt.LOAD_TIMESTAMP       = :v_run_ts
-    WHEN NOT MATCHED THEN INSERT (
+    INSERT INTO SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_RISK_SCORED (
+        PART_NUMBER, PART_NAME, MANUFACTURER, CATEGORY,
+        WEIGHT_KG, UNIT_PRICE_USD, QUANTITY_ON_HAND, REORDER_LEVEL,
+        LIFECYCLE_STATUS, CERTIFICATION_STATUS, INSTALLATION_DATE,
+        LEAD_TIME_DAYS, SUPPLIER, WAREHOUSE_LOCATION, COUNTRY_OF_ORIGIN,
+        CREATED_AT, UPDATED_AT, RISK_SCORE
+    )
+    SELECT
         PART_NUMBER,
         PART_NAME,
         MANUFACTURER,
@@ -217,33 +144,166 @@ BEGIN
         COUNTRY_OF_ORIGIN,
         CREATED_AT,
         UPDATED_AT,
-        RISK_SCORE,
-        STATUS,
-        LOAD_TIMESTAMP
-    ) VALUES (
-        src.PART_NUMBER,
-        src.PART_NAME,
-        src.MANUFACTURER,
-        src.CATEGORY,
-        src.WEIGHT_KG,
-        src.UNIT_PRICE_USD,
-        src.QUANTITY_ON_HAND,
-        src.REORDER_LEVEL,
-        src.LIFECYCLE_STATUS,
-        src.CERTIFICATION_STATUS,
-        src.INSTALLATION_DATE,
-        src.LEAD_TIME_DAYS,
-        src.SUPPLIER,
-        src.WAREHOUSE_LOCATION,
-        src.COUNTRY_OF_ORIGIN,
-        src.CREATED_AT,
-        src.UPDATED_AT,
-        src.RISK_SCORE,
-        'Active',
-        :v_run_ts
-    );
+        -- BR-08..BR-11: derive risk score from lifecycle, certification, quantity and lead time
+        CASE
+            WHEN LIFECYCLE_STATUS     = 'Obsolete'       THEN 'HIGH'
+            WHEN CERTIFICATION_STATUS = 'Non-Certified'  THEN 'HIGH'
+            WHEN QUANTITY_ON_HAND <= REORDER_LEVEL       THEN 'MEDIUM'
+            WHEN LEAD_TIME_DAYS   > 90                   THEN 'MEDIUM'
+            ELSE 'LOW'
+        END AS RISK_SCORE
+    FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_DEDUPLICATED;
 
-    -- Read MERGE result counts
+    -- ================================================================
+    -- STEP 4: Count incremental source rows (FR-01, BR-01, BR-02)
+    -- ================================================================
+    -- When v_has_prior_run is FALSE (first run) load all records (BR-02).
+    -- Otherwise filter by UPDATED_AT > last successful timestamp (BR-01).
+    IF (:v_has_prior_run = FALSE) THEN
+        -- BR-02: full load - no timestamp filter
+        SELECT COUNT(*)
+        INTO :v_source_count
+        FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_RISK_SCORED;
+    ELSE
+        -- BR-01: incremental filter on UPDATED_AT
+        SELECT COUNT(*)
+        INTO :v_source_count
+        FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_RISK_SCORED
+        WHERE UPDATED_AT > :v_last_run_ts;
+    END IF;
+
+    -- ================================================================
+    -- STEP 5: SCD Type 1 MERGE into AEROSPACE_PARTS (FR-03, FR-04, BR-04, BR-05)
+    -- ================================================================
+    -- The source CTE applies the incremental filter (BR-01/BR-02).
+    -- WHEN MATCHED -> overwrite all non-key columns (BR-04, SCD1).
+    -- WHEN NOT MATCHED BY TARGET -> insert new row.
+    -- Soft-delete (BR-05) is handled separately in STEP 6 to allow
+    -- accurate row-count capture from RESULT_SCAN.
+    IF (:v_has_prior_run = FALSE) THEN
+        -- Full load merge (BR-02)
+        MERGE INTO SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS AS TGT
+        USING (
+            -- Source: full risk-scored, cleansed, transformed, deduplicated view chain
+            SELECT
+                PART_NUMBER,
+                PART_NAME,
+                MANUFACTURER,          -- Already UPPER() per BR-06
+                CATEGORY,
+                WEIGHT_KG,             -- Already cleansed per BR-07
+                UNIT_PRICE_USD,
+                QUANTITY_ON_HAND,
+                REORDER_LEVEL,
+                LIFECYCLE_STATUS,
+                CERTIFICATION_STATUS,
+                INSTALLATION_DATE,
+                LEAD_TIME_DAYS,
+                SUPPLIER,
+                WAREHOUSE_LOCATION,
+                COUNTRY_OF_ORIGIN,
+                RISK_SCORE,            -- Derived per BR-08..BR-11
+                CREATED_AT,
+                UPDATED_AT
+            FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_RISK_SCORED
+        ) AS SRC
+        ON TGT.PART_NUMBER = SRC.PART_NUMBER  -- Business key join (BR-04)
+        -- BR-04: SCD Type 1 - overwrite all non-key attributes
+        WHEN MATCHED THEN UPDATE SET
+            TGT.PART_NAME            = SRC.PART_NAME,
+            TGT.MANUFACTURER         = SRC.MANUFACTURER,
+            TGT.CATEGORY             = SRC.CATEGORY,
+            TGT.WEIGHT_KG            = SRC.WEIGHT_KG,
+            TGT.UNIT_PRICE_USD       = SRC.UNIT_PRICE_USD,
+            TGT.QUANTITY_ON_HAND     = SRC.QUANTITY_ON_HAND,
+            TGT.REORDER_LEVEL        = SRC.REORDER_LEVEL,
+            TGT.LIFECYCLE_STATUS     = SRC.LIFECYCLE_STATUS,
+            TGT.CERTIFICATION_STATUS = SRC.CERTIFICATION_STATUS,
+            TGT.INSTALLATION_DATE    = SRC.INSTALLATION_DATE,
+            TGT.LEAD_TIME_DAYS       = SRC.LEAD_TIME_DAYS,
+            TGT.SUPPLIER             = SRC.SUPPLIER,
+            TGT.WAREHOUSE_LOCATION   = SRC.WAREHOUSE_LOCATION,
+            TGT.COUNTRY_OF_ORIGIN    = SRC.COUNTRY_OF_ORIGIN,
+            TGT.RISK_SCORE           = SRC.RISK_SCORE,
+            TGT.UPDATED_AT           = SRC.UPDATED_AT,
+            TGT.LOAD_TIMESTAMP       = :v_run_ts,
+            TGT.STATUS               = 'Active'
+        -- New part numbers not yet in target
+        WHEN NOT MATCHED THEN INSERT (
+            PART_NUMBER, PART_NAME, MANUFACTURER, CATEGORY,
+            WEIGHT_KG, UNIT_PRICE_USD, QUANTITY_ON_HAND, REORDER_LEVEL,
+            LIFECYCLE_STATUS, CERTIFICATION_STATUS, INSTALLATION_DATE,
+            LEAD_TIME_DAYS, SUPPLIER, WAREHOUSE_LOCATION, COUNTRY_OF_ORIGIN,
+            RISK_SCORE, UPDATED_AT, LOAD_TIMESTAMP, STATUS, CREATED_AT
+        ) VALUES (
+            SRC.PART_NUMBER, SRC.PART_NAME, SRC.MANUFACTURER, SRC.CATEGORY,
+            SRC.WEIGHT_KG, SRC.UNIT_PRICE_USD, SRC.QUANTITY_ON_HAND, SRC.REORDER_LEVEL,
+            SRC.LIFECYCLE_STATUS, SRC.CERTIFICATION_STATUS, SRC.INSTALLATION_DATE,
+            SRC.LEAD_TIME_DAYS, SRC.SUPPLIER, SRC.WAREHOUSE_LOCATION, SRC.COUNTRY_OF_ORIGIN,
+            SRC.RISK_SCORE, SRC.UPDATED_AT, :v_run_ts, 'Active', SRC.CREATED_AT
+        );
+    ELSE
+        -- Incremental merge (BR-01)
+        MERGE INTO SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS AS TGT
+        USING (
+            -- Source: incremental slice filtered by last successful run timestamp
+            SELECT
+                PART_NUMBER,
+                PART_NAME,
+                MANUFACTURER,
+                CATEGORY,
+                WEIGHT_KG,
+                UNIT_PRICE_USD,
+                QUANTITY_ON_HAND,
+                REORDER_LEVEL,
+                LIFECYCLE_STATUS,
+                CERTIFICATION_STATUS,
+                INSTALLATION_DATE,
+                LEAD_TIME_DAYS,
+                SUPPLIER,
+                WAREHOUSE_LOCATION,
+                COUNTRY_OF_ORIGIN,
+                RISK_SCORE,
+                CREATED_AT,
+                UPDATED_AT
+            FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_RISK_SCORED
+            WHERE UPDATED_AT > :v_last_run_ts  -- BR-01: incremental filter
+        ) AS SRC
+        ON TGT.PART_NUMBER = SRC.PART_NUMBER
+        WHEN MATCHED THEN UPDATE SET
+            TGT.PART_NAME            = SRC.PART_NAME,
+            TGT.MANUFACTURER         = SRC.MANUFACTURER,
+            TGT.CATEGORY             = SRC.CATEGORY,
+            TGT.WEIGHT_KG            = SRC.WEIGHT_KG,
+            TGT.UNIT_PRICE_USD       = SRC.UNIT_PRICE_USD,
+            TGT.QUANTITY_ON_HAND     = SRC.QUANTITY_ON_HAND,
+            TGT.REORDER_LEVEL        = SRC.REORDER_LEVEL,
+            TGT.LIFECYCLE_STATUS     = SRC.LIFECYCLE_STATUS,
+            TGT.CERTIFICATION_STATUS = SRC.CERTIFICATION_STATUS,
+            TGT.INSTALLATION_DATE    = SRC.INSTALLATION_DATE,
+            TGT.LEAD_TIME_DAYS       = SRC.LEAD_TIME_DAYS,
+            TGT.SUPPLIER             = SRC.SUPPLIER,
+            TGT.WAREHOUSE_LOCATION   = SRC.WAREHOUSE_LOCATION,
+            TGT.COUNTRY_OF_ORIGIN    = SRC.COUNTRY_OF_ORIGIN,
+            TGT.RISK_SCORE           = SRC.RISK_SCORE,
+            TGT.UPDATED_AT           = SRC.UPDATED_AT,
+            TGT.LOAD_TIMESTAMP       = :v_run_ts,
+            TGT.STATUS               = 'Active'
+        WHEN NOT MATCHED THEN INSERT (
+            PART_NUMBER, PART_NAME, MANUFACTURER, CATEGORY,
+            WEIGHT_KG, UNIT_PRICE_USD, QUANTITY_ON_HAND, REORDER_LEVEL,
+            LIFECYCLE_STATUS, CERTIFICATION_STATUS, INSTALLATION_DATE,
+            LEAD_TIME_DAYS, SUPPLIER, WAREHOUSE_LOCATION, COUNTRY_OF_ORIGIN,
+            RISK_SCORE, UPDATED_AT, LOAD_TIMESTAMP, STATUS, CREATED_AT
+        ) VALUES (
+            SRC.PART_NUMBER, SRC.PART_NAME, SRC.MANUFACTURER, SRC.CATEGORY,
+            SRC.WEIGHT_KG, SRC.UNIT_PRICE_USD, SRC.QUANTITY_ON_HAND, SRC.REORDER_LEVEL,
+            SRC.LIFECYCLE_STATUS, SRC.CERTIFICATION_STATUS, SRC.INSTALLATION_DATE,
+            SRC.LEAD_TIME_DAYS, SRC.SUPPLIER, SRC.WAREHOUSE_LOCATION, SRC.COUNTRY_OF_ORIGIN,
+            SRC.RISK_SCORE, SRC.UPDATED_AT, :v_run_ts, 'Active', SRC.CREATED_AT
+        );
+    END IF;
+
+    -- Capture MERGE row counts from RESULT_SCAN (inserted and updated clauses both present)
     SELECT
         "number of rows inserted",
         "number of rows updated"
@@ -251,37 +311,48 @@ BEGIN
     FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
 
     -- ================================================================
-    -- STEP 4: Soft-delete parts absent from the full current source
-    --         FR-04 / BR-05
-    --         Compare against the ENTIRE source table (not just staging)
-    --         so that unchanged rows present in source are not deleted.
-    --         Set LIFECYCLE_STATUS (checked by validations) AND STATUS.
+    -- STEP 6: Soft-delete records absent from full source (FR-04, BR-05)
     -- ================================================================
-    UPDATE SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS AS tgt
+    -- Any PART_NUMBER in the target that does NOT appear in the
+    -- deduplicated source view at all is marked Decommissioned.
+    -- This uses the full (non-incremental) deduplicated table so that
+    -- parts that were never in this run's incremental slice are also
+    -- evaluated for decommission.
+    UPDATE SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS AS TGT
     SET
-        tgt.LIFECYCLE_STATUS = 'Decommissioned',  -- BR-05: field checked by validations
-        tgt.STATUS           = 'Decommissioned',
-        tgt.LOAD_TIMESTAMP   = :v_run_ts
-    WHERE tgt.LIFECYCLE_STATUS != 'Decommissioned'
-      AND NOT EXISTS (
-          SELECT 1
-          FROM IDEA_2_DB.PUBLIC.AEROSPACE_PARTS_SOURCE AS src
-          WHERE src.PART_NUMBER = tgt.PART_NUMBER
+        TGT.STATUS         = 'Decommissioned',   -- BR-05: soft delete
+        TGT.LOAD_TIMESTAMP = :v_run_ts
+    WHERE TGT.STATUS <> 'Decommissioned'         -- Avoid redundant updates
+      AND TGT.PART_NUMBER NOT IN (
+          -- Full source deduplicated - all currently known PART_NUMBERs
+          SELECT PART_NUMBER
+          FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_DEDUPLICATED
       );
 
+    -- Capture soft-delete count via SQLROWCOUNT
     v_soft_del := SQLROWCOUNT;
 
     -- ================================================================
-    -- STEP 5: Capture active target count post-load (BR-12)
+    -- STEP 7: Count target rows post-merge (FR-08, BR-12)
     -- ================================================================
     SELECT COUNT(*)
-    INTO   :v_target_count
-    FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS
-    WHERE  LIFECYCLE_STATUS != 'Decommissioned';
+    INTO :v_target_count
+    FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS;
 
     -- ================================================================
-    -- STEP 6: Write reconciliation record (FR-08 / BR-12)
+    -- STEP 8: Write reconciliation log (FR-08, BR-12)
     -- ================================================================
+    -- Captures source_count, target_count, inserted, updated, soft-deleted, run_timestamp.
+    v_end_ts      := CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ;
+    v_elapsed_sec := DATEDIFF('second', :v_start_ts, :v_end_ts);
+
+    -- FR-09: SLA check - flag if elapsed time exceeds 300 seconds (5 minutes)
+    IF (:v_elapsed_sec > 300) THEN
+        v_sla_note := 'SLA BREACH: elapsed ' || :v_elapsed_sec || 's exceeds 300s threshold for 1M records.';
+    ELSE
+        v_sla_note := 'SLA OK: elapsed ' || :v_elapsed_sec || 's.';
+    END IF;
+
     INSERT INTO SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG (
         PIPELINE_NAME,
         RUN_TIMESTAMP,
@@ -301,19 +372,20 @@ BEGIN
         :v_upd,
         :v_soft_del,
         'SUCCESS',
-        NULL
+        :v_sla_note
     );
 
     -- ================================================================
-    -- STEP 7: Update PIPELINE_METADATA watermark (FR-01)
+    -- STEP 9: Update PIPELINE_METADATA with SUCCESS status (FR-01)
     -- ================================================================
-    MERGE INTO SDLC_DB.SDLC_PIPELINES.PIPELINE_METADATA AS m
-    USING (SELECT :v_pipeline_name AS pn) AS s
-        ON m.PIPELINE_NAME = s.pn
+    -- Upsert so that both first-run (INSERT) and subsequent runs (UPDATE) are handled.
+    MERGE INTO SDLC_DB.SDLC_PIPELINES.PIPELINE_METADATA AS M
+    USING (SELECT :v_pipeline_name AS PIPELINE_NAME) AS SRC
+    ON M.PIPELINE_NAME = SRC.PIPELINE_NAME
     WHEN MATCHED THEN UPDATE SET
-        m.LAST_RUN_TIMESTAMP = :v_run_ts,
-        m.LAST_RUN_STATUS    = 'SUCCESS',
-        m.UPDATED_AT         = :v_run_ts
+        M.LAST_RUN_TIMESTAMP = :v_run_ts,
+        M.LAST_RUN_STATUS    = 'SUCCESS',
+        M.UPDATED_AT         = :v_run_ts
     WHEN NOT MATCHED THEN INSERT (
         PIPELINE_NAME,
         LAST_RUN_TIMESTAMP,
@@ -327,30 +399,33 @@ BEGIN
     );
 
     -- ================================================================
-    -- STEP 8: Return summary
+    -- STEP 10: Build and return summary string
     -- ================================================================
     v_summary :=
-        'Pipeline: '          || :v_pipeline_name
-        || ' | Run: '         || TO_VARCHAR(:v_run_ts)
-        || ' | Staged: '      || :v_source_count
-        || ' | Inserted: '    || :v_ins
-        || ' | Updated: '     || :v_upd
-        || ' | SoftDeleted: ' || :v_soft_del
-        || ' | TargetActive:' || :v_target_count
-        || ' | Status: SUCCESS';
+        'PIPELINE: '         || :v_pipeline_name
+        || ' | RUN_TS: '     || TO_VARCHAR(:v_run_ts)
+        || ' | SOURCE: '     || :v_source_count
+        || ' | INSERTED: '   || :v_ins
+        || ' | UPDATED: '    || :v_upd
+        || ' | SOFT_DEL: '   || :v_soft_del
+        || ' | TARGET: '     || :v_target_count
+        || ' | ' || :v_sla_note;
 
     RETURN :v_summary;
 
 EXCEPTION
     WHEN OTHER THEN
+        -- Capture error details before any further statements
         LET err VARCHAR := SQLERRM;
 
-        MERGE INTO SDLC_DB.SDLC_PIPELINES.PIPELINE_METADATA AS m
-        USING (SELECT :v_pipeline_name AS pn) AS s
-            ON m.PIPELINE_NAME = s.pn
+        -- Attempt to log the failure into PIPELINE_METADATA
+        MERGE INTO SDLC_DB.SDLC_PIPELINES.PIPELINE_METADATA AS M
+        USING (SELECT :v_pipeline_name AS PIPELINE_NAME) AS SRC
+        ON M.PIPELINE_NAME = SRC.PIPELINE_NAME
         WHEN MATCHED THEN UPDATE SET
-            m.LAST_RUN_STATUS = 'FAILED',
-            m.UPDATED_AT      = CURRENT_TIMESTAMP()
+            M.LAST_RUN_TIMESTAMP = :v_run_ts,
+            M.LAST_RUN_STATUS    = 'FAILED',
+            M.UPDATED_AT         = :v_run_ts
         WHEN NOT MATCHED THEN INSERT (
             PIPELINE_NAME,
             LAST_RUN_TIMESTAMP,
@@ -358,9 +433,9 @@ EXCEPTION
             UPDATED_AT
         ) VALUES (
             :v_pipeline_name,
-            CURRENT_TIMESTAMP(),
+            :v_run_ts,
             'FAILED',
-            CURRENT_TIMESTAMP()
+            :v_run_ts
         );
 
         RETURN 'FAILED: ' || :err;
