@@ -6,12 +6,12 @@
 -- Reuse Route   : PIPELINE
 -- Description   : Schedules SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE
 -- Author        : Sucharitha
--- Created Date  : 2026-10-23
+-- Created Date  : 2026-10-26
 -- Dependencies  :
 --   - SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE
 -- Business Rules: BR-01, BR-02, BR-03, BR-04, BR-05, BR-06, BR-07, BR-08, BR-09, BR-10, BR-11, BR-12
 -- Change History:
---   2026-10-23  Sucharitha  SCRUM-158  Initial generation (PIPELINE)
+--   2026-10-26  Sucharitha  SCRUM-158  Initial generation (PIPELINE)
 -- =============================================================================
 
 -- Scheduled orchestration of SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE (as stated in the MOM (0 5 * * * UTC)).
