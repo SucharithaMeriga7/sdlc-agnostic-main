@@ -8,6 +8,9 @@
 -- Author        : Sucharitha
 -- Created Date  : 2026-11-14
 -- Dependencies  :
+--   - SDLC_DB.SDLC_PIPELINES.PARTS
+--   - SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG
+--   - SDLC_DB.SDLC_PIPELINES.ETL_CONTROL
 --   - SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED
 -- Business Rules: BR-01, BR-02, BR-03, BR-04, BR-05, BR-06, BR-07, BR-08, BR-09, BR-10, BR-11, BR-12
 -- Change History:
@@ -21,367 +24,260 @@ EXECUTE AS CALLER
 AS
 $$
 DECLARE
-    -- -------------------------------------------------------------------------
-    -- Run-level metadata variables
-    -- -------------------------------------------------------------------------
-    v_run_ts          TIMESTAMP_NTZ(9);   -- wall-clock start of this run
-    v_watermark_ts    TIMESTAMP_NTZ(9);   -- watermark read from PIPELINE_WATERMARK_PARAM
-    v_load_type       VARCHAR(20);        -- 'FULL' or 'INCREMENTAL'
-    v_new_watermark   TIMESTAMP_NTZ(9);   -- max UPDATED_AT from source extract
-
-    -- -------------------------------------------------------------------------
-    -- Row-count variables
-    -- -------------------------------------------------------------------------
-    v_source_count    NUMBER(18,0);       -- raw source rows before dedup
-    v_dedup_count     NUMBER(18,0);       -- rows after deduplication (view output)
-    v_inserted        NUMBER(18,0);       -- MERGE: rows inserted (new PART_NUMBERs)
-    v_updated         NUMBER(18,0);       -- MERGE: rows updated (existing PART_NUMBERs)
-    v_deleted         NUMBER(18,0);       -- soft-deleted rows (Decommissioned)
-    v_target_count    NUMBER(18,0);       -- active rows in target after load
-    v_discrepancy     NUMBER(18,0);       -- |dedup_count - (inserted + updated)|
-
-    -- -------------------------------------------------------------------------
-    -- Error-handling variables
-    -- -------------------------------------------------------------------------
-    v_status          VARCHAR(20);        -- 'SUCCESS' or 'FAILED'
-    v_err             VARCHAR(4000);      -- error message captured in handler
-
-    -- -------------------------------------------------------------------------
-    -- Summary string returned to caller
-    -- -------------------------------------------------------------------------
-    v_summary         VARCHAR(4000);
+    v_pipeline_name     VARCHAR  DEFAULT 'AEROSPACE_PARTS_INVENTORY_INTEGRATION';
+    v_run_ts            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP();
+    v_load_type         VARCHAR  DEFAULT 'INCREMENTAL';
+    v_watermark         TIMESTAMP_NTZ DEFAULT NULL;
+    v_new_watermark     TIMESTAMP_NTZ DEFAULT NULL;
+    v_source_count      NUMBER(18,0) DEFAULT 0;
+    v_excluded_count    NUMBER(18,0) DEFAULT 0;
+    v_dedup_count       NUMBER(18,0) DEFAULT 0;
+    v_ins               NUMBER(18,0) DEFAULT 0;
+    v_upd               NUMBER(18,0) DEFAULT 0;
+    v_del               NUMBER(18,0) DEFAULT 0;
+    v_target_count      NUMBER(18,0) DEFAULT 0;
+    v_discrepancy       NUMBER(18,0) DEFAULT 0;
+    v_summary           VARCHAR  DEFAULT '';
+    v_err               VARCHAR  DEFAULT NULL;
 
 BEGIN
     -- =========================================================================
-    -- STEP 0: Initialise run metadata
+    -- STEP 1: Read last successful watermark from ETL_CONTROL (FR-01, BR-01, BR-02)
     -- =========================================================================
-    v_run_ts  := CURRENT_TIMESTAMP()::TIMESTAMP_NTZ(9);
-    v_status  := 'SUCCESS';
-    v_err     := NULL;
+    SELECT COALESCE(MAX(LAST_SUCCESSFUL_RUN_TS), NULL)
+    INTO   :v_watermark
+    FROM   SDLC_DB.SDLC_PIPELINES.ETL_CONTROL
+    WHERE  PIPELINE_NAME = :v_pipeline_name;
 
-    -- =========================================================================
-    -- STEP 1: Read current watermark from PIPELINE_WATERMARK_PARAM
-    --         BR-01: incremental filter uses this value.
-    --         BR-02: NULL means first run -> full load.
-    -- =========================================================================
-    SELECT WATERMARK_TS
-    INTO   :v_watermark_ts
-    FROM   SDLC_DB.SDLC_PIPELINES.PIPELINE_WATERMARK_PARAM
-    LIMIT  1;
-
-    -- Determine load type label for reconciliation log
-    IF (v_watermark_ts IS NULL) THEN
-        v_load_type := 'FULL';          -- BR-02: no prior run
+    IF (:v_watermark IS NULL) THEN
+        v_load_type := 'FULL';
     ELSE
-        v_load_type := 'INCREMENTAL';   -- BR-01: filter by watermark
+        v_load_type := 'INCREMENTAL';
     END IF;
 
     -- =========================================================================
-    -- STEP 2: Count raw source rows for reconciliation (before dedup)
-    --         Mirrors the WHERE clause used in VW_AEROSPACE_PARTS_DEDUPLICATED
-    --         so SOURCE_COUNT reflects the same extract window.
+    -- STEP 2: Count raw source records for reconciliation (BR-12)
     -- =========================================================================
     SELECT COUNT(*)
     INTO   :v_source_count
-    FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE_DEV_SRC src
-    WHERE  src.PART_NUMBER IS NOT NULL
-      AND  (
-               :v_watermark_ts IS NULL
-               OR src.UPDATED_AT > :v_watermark_ts
-           );
+    FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE
+    WHERE  (:v_load_type = 'FULL' OR UPDATED_AT > :v_watermark);
+
+    v_excluded_count := 0;
 
     -- =========================================================================
-    -- STEP 3: Count deduplicated rows from the adapted view (BR-03)
-    --         VW_AEROSPACE_PARTS_DEDUPLICATED already applies ROW_NUMBER()=1
-    --         and the watermark filter via PIPELINE_WATERMARK_PARAM cross-join.
+    -- STEP 3: Count deduplicated records (FR-02, BR-03)
+    -- Inline ROW_NUMBER() dedup directly on AEROSPACE_PARTS_SOURCE;
+    -- replaces the view reference which returned 0 rows.
     -- =========================================================================
     SELECT COUNT(*)
     INTO   :v_dedup_count
-    FROM   SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED;
+    FROM (
+        SELECT PART_NUMBER,
+               ROW_NUMBER() OVER (PARTITION BY PART_NUMBER ORDER BY UPDATED_AT DESC) AS RN
+        FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE
+        WHERE  (:v_load_type = 'FULL' OR UPDATED_AT > :v_watermark)
+    )
+    WHERE RN = 1;
 
     -- =========================================================================
-    -- STEP 4: Capture new watermark = max UPDATED_AT in current extract
-    --         Used to advance the watermark after a successful run.
+    -- STEP 4: Capture new watermark before MERGE
     -- =========================================================================
     SELECT MAX(UPDATED_AT)
     INTO   :v_new_watermark
-    FROM   SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED;
+    FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE
+    WHERE  (:v_load_type = 'FULL' OR UPDATED_AT > :v_watermark);
 
     -- =========================================================================
-    -- STEP 5: MERGE into AEROSPACE_PARTS_TARGET
-    --
-    --   WHEN MATCHED (BR-04: SCD Type 1 overwrite):
-    --     - UPPER(MANUFACTURER)                          -> BR-06
-    --     - CASE WHEN WEIGHT_KG <= 0 THEN -1 ELSE ...   -> BR-07
-    --     - Inline RISK_SCORE CASE expression            -> BR-08 to BR-11
-    --
-    --   WHEN NOT MATCHED (new PART_NUMBER):
-    --     - Same transformations applied on INSERT
-    --
-    --   BR-05 soft delete handled in a separate UPDATE after MERGE
+    -- STEP 5: MERGE into PARTS - SCD Type 1 (FR-03, BR-04)
+    --   FR-05/BR-06: UPPER(MANUFACTURER)
+    --   FR-06/BR-07: IFF(WEIGHT_KG<=0,-1,WEIGHT_KG)
+    --   FR-07/BR-08/09/10/11: CASE RISK_SCORE
+    -- Inline ROW_NUMBER() dedup replaces view to guarantee rows are visible.
     -- =========================================================================
-    MERGE INTO SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET  tgt
+    MERGE INTO SDLC_DB.SDLC_PIPELINES.PARTS AS TGT
     USING (
-        -- Source CTE: pull from deduplicated view, apply all inline transforms
         SELECT
-            src.PART_NUMBER,
-            src.PART_NAME,
-            -- BR-06: MANUFACTURER must be stored as UPPER() (FR-05)
-            UPPER(src.MANUFACTURER)                                         AS MANUFACTURER,
-            -- BR-07: replace WEIGHT_KG <= 0 with -1 (FR-06)
+            PART_NUMBER,
+            PART_NAME,
+            UPPER(MANUFACTURER)                                              AS MANUFACTURER,
+            IFF(WEIGHT_KG <= 0, -1, WEIGHT_KG)                              AS WEIGHT_KG,
+            UNIT_PRICE_USD,
+            CERTIFICATION_STATUS,
+            LEAD_TIME_DAYS,
+            LIFECYCLE_STATUS,
+            INSTALLATION_DATE,
+            QUANTITY_ON_HAND,
+            WAREHOUSE_LOCATION,
+            SUPPLIER_CODE,
+            COUNTRY_OF_ORIGIN,
+            UPDATED_AT,
+            CATEGORY,
+            SUPPLIER_ID,
+            PART_STATUS,
+            INVENTORY_HEALTH_STATUS,
+            STOCK_QUANTITY,
+            SUPPLY_RISK_LEVEL,
+            SUPPLIER_COUNT,
             CASE
-                WHEN src.WEIGHT_KG <= 0 THEN -1
-                ELSE src.WEIGHT_KG
-            END::NUMBER(10,3)                                               AS WEIGHT_KG,
-            src.UNIT_PRICE_USD,
-            src.CERTIFICATION_STATUS,
-            src.LEAD_TIME_DAYS,
-            src.LIFECYCLE_STATUS,
-            src.INSTALLATION_DATE,
-            src.QUANTITY_ON_HAND,
-            src.WAREHOUSE_LOCATION,
-            src.SUPPLIER_CODE,
-            src.COUNTRY_OF_ORIGIN,
-            src.UPDATED_AT,
-            src.CATEGORY,
-            src.SUPPLIER_ID,
-            src.PART_STATUS,
-            src.INVENTORY_HEALTH_STATUS,
-            src.STOCK_QUANTITY,
-            src.SUPPLY_RISK_LEVEL,
-            src.SUPPLIER_COUNT,
-            -- BR-08 to BR-11: inline RISK_SCORE derivation (FR-07)
-            CASE
-                -- BR-08: High Risk: Pending AND lead time > 60
-                WHEN src.CERTIFICATION_STATUS = 'Pending'
-                     AND src.LEAD_TIME_DAYS > 60
+                WHEN CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 60
                     THEN 'High Risk'
-                -- BR-09: Medium Risk: Pending OR lead time > 100 (High Risk not met)
-                WHEN src.CERTIFICATION_STATUS = 'Pending'
-                     OR  src.LEAD_TIME_DAYS > 100
+                WHEN (CERTIFICATION_STATUS = 'Pending' OR LEAD_TIME_DAYS > 100)
                     THEN 'Medium Risk'
-                -- BR-10: Low Risk: FAA/EASA/Dual AND lead time <= 60
-                WHEN src.CERTIFICATION_STATUS IN ('FAA', 'EASA', 'Dual')
-                     AND src.LEAD_TIME_DAYS <= 60
+                WHEN CERTIFICATION_STATUS IN ('FAA', 'EASA', 'Dual') AND LEAD_TIME_DAYS <= 60
                     THEN 'Low Risk'
-                -- BR-11: all remaining cases -> Medium Risk
                 ELSE 'Medium Risk'
-            END                                                             AS RISK_SCORE
-        FROM SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED src
-    ) AS staged
-    -- Join key: BR-04 business key is PART_NUMBER
-    ON tgt.PART_NUMBER = staged.PART_NUMBER
-
-    -- -------------------------------------------------------------------------
-    -- WHEN MATCHED: SCD Type 1 overwrite (BR-04)
-    -- -------------------------------------------------------------------------
+            END AS RISK_SCORE
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (PARTITION BY PART_NUMBER ORDER BY UPDATED_AT DESC) AS _RN
+            FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE
+            WHERE  (:v_load_type = 'FULL' OR UPDATED_AT > :v_watermark)
+        )
+        WHERE _RN = 1
+    ) AS SRC
+    ON TGT.PART_NUMBER = SRC.PART_NUMBER
     WHEN MATCHED THEN UPDATE SET
-        tgt.PART_NAME               = staged.PART_NAME,
-        tgt.MANUFACTURER            = staged.MANUFACTURER,        -- BR-06
-        tgt.WEIGHT_KG               = staged.WEIGHT_KG,           -- BR-07
-        tgt.UNIT_PRICE_USD          = staged.UNIT_PRICE_USD,
-        tgt.CERTIFICATION_STATUS    = staged.CERTIFICATION_STATUS,
-        tgt.LEAD_TIME_DAYS          = staged.LEAD_TIME_DAYS,
-        tgt.LIFECYCLE_STATUS        = staged.LIFECYCLE_STATUS,
-        tgt.INSTALLATION_DATE       = staged.INSTALLATION_DATE,
-        tgt.QUANTITY_ON_HAND        = staged.QUANTITY_ON_HAND,
-        tgt.WAREHOUSE_LOCATION      = staged.WAREHOUSE_LOCATION,
-        tgt.SUPPLIER_CODE           = staged.SUPPLIER_CODE,
-        tgt.COUNTRY_OF_ORIGIN       = staged.COUNTRY_OF_ORIGIN,
-        tgt.UPDATED_AT              = staged.UPDATED_AT,
-        tgt.CATEGORY                = staged.CATEGORY,
-        tgt.SUPPLIER_ID             = staged.SUPPLIER_ID,
-        tgt.PART_STATUS             = staged.PART_STATUS,
-        tgt.INVENTORY_HEALTH_STATUS = staged.INVENTORY_HEALTH_STATUS,
-        tgt.STOCK_QUANTITY          = staged.STOCK_QUANTITY,
-        tgt.SUPPLY_RISK_LEVEL       = staged.SUPPLY_RISK_LEVEL,
-        tgt.SUPPLIER_COUNT          = staged.SUPPLIER_COUNT,
-        tgt.RISK_SCORE              = staged.RISK_SCORE,           -- BR-08 to BR-11
-        tgt.DW_UPDATE_TS            = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ(9)
-
-    -- -------------------------------------------------------------------------
-    -- WHEN NOT MATCHED: new PART_NUMBER -> INSERT
-    -- -------------------------------------------------------------------------
+        TGT.PART_NAME               = SRC.PART_NAME,
+        TGT.MANUFACTURER            = SRC.MANUFACTURER,
+        TGT.WEIGHT_KG               = SRC.WEIGHT_KG,
+        TGT.UNIT_PRICE_USD          = SRC.UNIT_PRICE_USD,
+        TGT.CERTIFICATION_STATUS    = SRC.CERTIFICATION_STATUS,
+        TGT.LEAD_TIME_DAYS          = SRC.LEAD_TIME_DAYS,
+        TGT.LIFECYCLE_STATUS        = SRC.LIFECYCLE_STATUS,
+        TGT.INSTALLATION_DATE       = SRC.INSTALLATION_DATE,
+        TGT.QUANTITY_ON_HAND        = SRC.QUANTITY_ON_HAND,
+        TGT.WAREHOUSE_LOCATION      = SRC.WAREHOUSE_LOCATION,
+        TGT.SUPPLIER_CODE           = SRC.SUPPLIER_CODE,
+        TGT.COUNTRY_OF_ORIGIN       = SRC.COUNTRY_OF_ORIGIN,
+        TGT.UPDATED_AT              = SRC.UPDATED_AT,
+        TGT.CATEGORY                = SRC.CATEGORY,
+        TGT.SUPPLIER_ID             = SRC.SUPPLIER_ID,
+        TGT.PART_STATUS             = SRC.PART_STATUS,
+        TGT.INVENTORY_HEALTH_STATUS = SRC.INVENTORY_HEALTH_STATUS,
+        TGT.STOCK_QUANTITY          = SRC.STOCK_QUANTITY,
+        TGT.SUPPLY_RISK_LEVEL       = SRC.SUPPLY_RISK_LEVEL,
+        TGT.SUPPLIER_COUNT          = SRC.SUPPLIER_COUNT,
+        TGT.RISK_SCORE              = SRC.RISK_SCORE,
+        TGT.DW_UPDATE_TS            = CURRENT_TIMESTAMP()
     WHEN NOT MATCHED THEN INSERT (
-        PART_NUMBER,
-        PART_NAME,
-        MANUFACTURER,
-        WEIGHT_KG,
-        UNIT_PRICE_USD,
-        CERTIFICATION_STATUS,
-        LEAD_TIME_DAYS,
-        LIFECYCLE_STATUS,
-        INSTALLATION_DATE,
-        QUANTITY_ON_HAND,
-        WAREHOUSE_LOCATION,
-        SUPPLIER_CODE,
-        COUNTRY_OF_ORIGIN,
-        UPDATED_AT,
-        CATEGORY,
-        SUPPLIER_ID,
-        PART_STATUS,
-        INVENTORY_HEALTH_STATUS,
-        STOCK_QUANTITY,
-        SUPPLY_RISK_LEVEL,
-        SUPPLIER_COUNT,
-        RISK_SCORE,
-        DW_INSERT_TS,
-        DW_UPDATE_TS
+        PART_NUMBER, PART_NAME, MANUFACTURER, WEIGHT_KG, UNIT_PRICE_USD,
+        CERTIFICATION_STATUS, LEAD_TIME_DAYS, LIFECYCLE_STATUS, INSTALLATION_DATE,
+        QUANTITY_ON_HAND, WAREHOUSE_LOCATION, SUPPLIER_CODE, COUNTRY_OF_ORIGIN,
+        UPDATED_AT, CATEGORY, SUPPLIER_ID, PART_STATUS, INVENTORY_HEALTH_STATUS,
+        STOCK_QUANTITY, SUPPLY_RISK_LEVEL, SUPPLIER_COUNT, RISK_SCORE,
+        DW_INSERT_TS, DW_UPDATE_TS
     ) VALUES (
-        staged.PART_NUMBER,
-        staged.PART_NAME,
-        staged.MANUFACTURER,        -- BR-06: already UPPER()
-        staged.WEIGHT_KG,           -- BR-07: already normalised
-        staged.UNIT_PRICE_USD,
-        staged.CERTIFICATION_STATUS,
-        staged.LEAD_TIME_DAYS,
-        staged.LIFECYCLE_STATUS,
-        staged.INSTALLATION_DATE,
-        staged.QUANTITY_ON_HAND,
-        staged.WAREHOUSE_LOCATION,
-        staged.SUPPLIER_CODE,
-        staged.COUNTRY_OF_ORIGIN,
-        staged.UPDATED_AT,
-        staged.CATEGORY,
-        staged.SUPPLIER_ID,
-        staged.PART_STATUS,
-        staged.INVENTORY_HEALTH_STATUS,
-        staged.STOCK_QUANTITY,
-        staged.SUPPLY_RISK_LEVEL,
-        staged.SUPPLIER_COUNT,
-        staged.RISK_SCORE,          -- BR-08 to BR-11
-        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ(9),
-        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ(9)
+        SRC.PART_NUMBER, SRC.PART_NAME, SRC.MANUFACTURER, SRC.WEIGHT_KG, SRC.UNIT_PRICE_USD,
+        SRC.CERTIFICATION_STATUS, SRC.LEAD_TIME_DAYS, SRC.LIFECYCLE_STATUS, SRC.INSTALLATION_DATE,
+        SRC.QUANTITY_ON_HAND, SRC.WAREHOUSE_LOCATION, SRC.SUPPLIER_CODE, SRC.COUNTRY_OF_ORIGIN,
+        SRC.UPDATED_AT, SRC.CATEGORY, SRC.SUPPLIER_ID, SRC.PART_STATUS, SRC.INVENTORY_HEALTH_STATUS,
+        SRC.STOCK_QUANTITY, SRC.SUPPLY_RISK_LEVEL, SRC.SUPPLIER_COUNT, SRC.RISK_SCORE,
+        CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
     );
 
-    -- =========================================================================
-    -- STEP 6: Read MERGE result counts
-    --         Snowflake MERGE result columns:
-    --           "number of rows inserted"  -> v_inserted
-    --           "number of rows updated"   -> v_updated
-    -- =========================================================================
-    SELECT
-        "number of rows inserted",
-        "number of rows updated"
-    INTO
-        :v_inserted,
-        :v_updated
-    FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    -- Read MERGE result counts (only INSERT and UPDATE clauses present)
+    SELECT "number of rows inserted", "number of rows updated"
+    INTO   :v_ins, :v_upd
+    FROM   TABLE(RESULT_SCAN(LAST_QUERY_ID()));
 
     -- =========================================================================
-    -- STEP 7: Soft delete orphaned target rows (BR-05)
-    --         Only apply to rows not already Decommissioned to avoid
-    --         unnecessary updates. Rows absent from the deduplicated view
-    --         are identified by LEFT JOIN / NOT EXISTS against the source.
+    -- STEP 6: Soft-delete - mark Decommissioned for records absent from
+    --         current source extract (FR-04, BR-05)
     -- =========================================================================
-    UPDATE SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET tgt
-    SET    tgt.LIFECYCLE_STATUS = 'Decommissioned',
-           tgt.DW_UPDATE_TS     = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ(9)
-    WHERE  tgt.LIFECYCLE_STATUS <> 'Decommissioned'
-      AND  NOT EXISTS (
-               SELECT 1
-               FROM   SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED src
-               WHERE  src.PART_NUMBER = tgt.PART_NUMBER
-           );
+    UPDATE SDLC_DB.SDLC_PIPELINES.PARTS AS TGT
+    SET
+        TGT.LIFECYCLE_STATUS = 'Decommissioned',
+        TGT.DW_UPDATE_TS     = CURRENT_TIMESTAMP()
+    WHERE TGT.LIFECYCLE_STATUS <> 'Decommissioned'
+      AND TGT.PART_NUMBER NOT IN (
+            SELECT PART_NUMBER
+            FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE
+      );
 
-    v_deleted := SQLROWCOUNT;
+    v_del := SQLROWCOUNT;
 
     -- =========================================================================
-    -- STEP 8: Count active (non-Decommissioned) target rows after load
+    -- STEP 7: Count active target records after load (BR-12)
     -- =========================================================================
     SELECT COUNT(*)
     INTO   :v_target_count
-    FROM   SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET
+    FROM   SDLC_DB.SDLC_PIPELINES.PARTS
     WHERE  LIFECYCLE_STATUS <> 'Decommissioned';
 
     -- =========================================================================
-    -- STEP 9: Advance watermark in PIPELINE_WATERMARK_PARAM
-    --         Only update if new_watermark is not NULL (i.e. source had rows).
+    -- STEP 8: Calculate discrepancy (BR-12)
     -- =========================================================================
-    IF (v_new_watermark IS NOT NULL) THEN
-        UPDATE SDLC_DB.SDLC_PIPELINES.PIPELINE_WATERMARK_PARAM
-        SET    WATERMARK_TS = :v_new_watermark;
-    END IF;
+    v_discrepancy := ABS(:v_dedup_count - (:v_ins + :v_upd));
 
     -- =========================================================================
-    -- STEP 10: Compute reconciliation discrepancy
-    --          |dedup_count - (inserted + updated)| should be 0.
+    -- STEP 9: Update ETL_CONTROL watermark (FR-01)
     -- =========================================================================
-    v_discrepancy := ABS(v_dedup_count - (v_inserted + v_updated));
-
-    -- =========================================================================
-    -- STEP 11: Log run to PIPELINE_RUN_LOG
-    -- =========================================================================
-    INSERT INTO SDLC_DB.SDLC_PIPELINES.PIPELINE_RUN_LOG (
-        RUN_TS,
-        LOAD_TYPE,
-        SOURCE_COUNT,
-        DEDUP_COUNT,
-        INSERTED,
-        UPDATED,
-        DELETED,
-        TARGET_COUNT,
-        DISCREPANCY,
-        STATUS,
-        ERROR_MESSAGE
+    MERGE INTO SDLC_DB.SDLC_PIPELINES.ETL_CONTROL AS CTL
+    USING (
+        SELECT :v_pipeline_name AS PIPELINE_NAME,
+               :v_new_watermark AS LAST_SUCCESSFUL_RUN_TS
+    ) AS SRC
+    ON CTL.PIPELINE_NAME = SRC.PIPELINE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        CTL.LAST_SUCCESSFUL_RUN_TS = SRC.LAST_SUCCESSFUL_RUN_TS
+    WHEN NOT MATCHED THEN INSERT (
+        PIPELINE_NAME,
+        LAST_SUCCESSFUL_RUN_TS
     ) VALUES (
-        :v_run_ts,
-        :v_load_type,
-        :v_source_count,
-        :v_dedup_count,
-        :v_inserted,
-        :v_updated,
-        :v_deleted,
-        :v_target_count,
-        :v_discrepancy,
-        :v_status,
-        :v_err
+        SRC.PIPELINE_NAME,
+        SRC.LAST_SUCCESSFUL_RUN_TS
     );
 
     -- =========================================================================
-    -- STEP 12: Build and return summary string
+    -- STEP 10: Log reconciliation results (FR-08, BR-12)
     -- =========================================================================
-    v_summary := 'Status='        || v_status
-              || ' LoadType='     || v_load_type
-              || ' Source='       || v_source_count::VARCHAR
-              || ' Dedup='        || v_dedup_count::VARCHAR
-              || ' Inserted='     || v_inserted::VARCHAR
-              || ' Updated='      || v_updated::VARCHAR
-              || ' Deleted='      || v_deleted::VARCHAR
-              || ' Target='       || v_target_count::VARCHAR
-              || ' Discrepancy='  || v_discrepancy::VARCHAR;
+    INSERT INTO SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG (
+        PIPELINE_NAME, RUN_TS, LOAD_TYPE, WATERMARK_USED,
+        SOURCE_COUNT, EXCLUDED_COUNT, DEDUPLICATED_COUNT,
+        INSERTED_COUNT, UPDATED_COUNT, DELETED_COUNT, TARGET_COUNT,
+        PIPELINE_STATUS, ERROR_MESSAGE, JIRA_ISSUE, DISCREPANCY_COUNT
+    ) VALUES (
+        :v_pipeline_name, :v_run_ts, :v_load_type, :v_watermark,
+        :v_source_count, :v_excluded_count, :v_dedup_count,
+        :v_ins, :v_upd, :v_del, :v_target_count,
+        'SUCCESS', NULL, 'SCRUM-62', :v_discrepancy
+    );
 
-    RETURN v_summary;
+    -- =========================================================================
+    -- STEP 11: Build and return summary string
+    -- =========================================================================
+    v_summary :=
+        'PIPELINE=' || :v_pipeline_name ||
+        ' | LOAD_TYPE='        || :v_load_type ||
+        ' | SOURCE='           || :v_source_count ||
+        ' | DEDUP='            || :v_dedup_count ||
+        ' | INSERTED='         || :v_ins ||
+        ' | UPDATED='          || :v_upd ||
+        ' | SOFT_DELETED='     || :v_del ||
+        ' | TARGET_ACTIVE='    || :v_target_count ||
+        ' | DISCREPANCY='      || :v_discrepancy ||
+        ' | STATUS=SUCCESS';
+
+    RETURN :v_summary;
 
 EXCEPTION
     WHEN OTHER THEN
         LET err VARCHAR := SQLERRM;
-        v_status := 'FAILED';
-        INSERT INTO SDLC_DB.SDLC_PIPELINES.PIPELINE_RUN_LOG (
-            RUN_TS,
-            LOAD_TYPE,
-            SOURCE_COUNT,
-            DEDUP_COUNT,
-            INSERTED,
-            UPDATED,
-            DELETED,
-            TARGET_COUNT,
-            DISCREPANCY,
-            STATUS,
-            ERROR_MESSAGE
+        LET err_code VARCHAR := SQLCODE;
+
+        INSERT INTO SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG (
+            PIPELINE_NAME, RUN_TS, LOAD_TYPE, WATERMARK_USED,
+            SOURCE_COUNT, EXCLUDED_COUNT, DEDUPLICATED_COUNT,
+            INSERTED_COUNT, UPDATED_COUNT, DELETED_COUNT, TARGET_COUNT,
+            PIPELINE_STATUS, ERROR_MESSAGE, JIRA_ISSUE, DISCREPANCY_COUNT
         ) VALUES (
-            :v_run_ts,
-            :v_load_type,
-            :v_source_count,
-            :v_dedup_count,
-            :v_inserted,
-            :v_updated,
-            :v_deleted,
-            :v_target_count,
-            :v_discrepancy,
-            :v_status,
-            :err
+            :v_pipeline_name, :v_run_ts, :v_load_type, :v_watermark,
+            :v_source_count, :v_excluded_count, :v_dedup_count,
+            :v_ins, :v_upd, :v_del, :v_target_count,
+            'FAILED', :err, 'SCRUM-62', :v_discrepancy
         );
-        RETURN 'FAILED: ' || :err;
+
+        RETURN 'FAILED: [' || :err_code || '] ' || :err;
 END;
 $$;
