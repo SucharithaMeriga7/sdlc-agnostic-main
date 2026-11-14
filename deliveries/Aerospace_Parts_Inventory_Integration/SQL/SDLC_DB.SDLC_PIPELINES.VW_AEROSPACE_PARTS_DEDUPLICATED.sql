@@ -2,22 +2,20 @@
 -- Object        : SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED
 -- Object Type   : VIEW
 -- Jira Story    : SCRUM-159
--- Requirements  : FR-01, FR-02
+-- Requirements  : FR-01, FR-02, FR-05, FR-06
 -- Reuse Route   : ADAPT_EXISTING
--- Description   : Adapted view built on top of the existing view definition. Replaces direct source reference with the same source table and PIPELINE_WATERMARK_PARAM cross-join already present in the existing DDL. This object is recreated as CREATE OR REPLACE to add no new logic beyond what already exists; the existing DDL is already correct and is reproduced here as the ADAPT delivery.
+-- Description   : Adapted view: incremental filter via PIPELINE_WATERMARK_PARAM, deduplication by PART_NUMBER/UPDATED_AT, UPPER(MANUFACTURER) for BR-06, IFF weight normalisation for BR-07.
 -- Author        : Sucharitha
 -- Created Date  : 2026-11-14
 -- Dependencies  :
---   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE_DEV_SRC
+--   - SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE
 --   - SDLC_DB.SDLC_PIPELINES.PIPELINE_WATERMARK_PARAM
--- Business Rules: BR-01, BR-02, BR-03
+-- Business Rules: BR-01, BR-02, BR-03, BR-06, BR-07
 -- Change History:
 --   2026-11-14  Sucharitha  SCRUM-159  Initial generation (ADAPT_EXISTING)
 -- =============================================================================
 
--- ADAPT_EXISTING: VW_AEROSPACE_PARTS_DEDUPLICATED
--- DELTA: No structural change needed; existing DDL already implements BR-01, BR-02, BR-03.
--- Reproduced as CREATE OR REPLACE for idempotency.
+-- ADAPTED FROM: SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED
 CREATE OR REPLACE VIEW SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED (
     PART_NUMBER,
     PART_NAME,
@@ -64,13 +62,15 @@ SELECT
     STOCK_QUANTITY,
     SUPPLY_RISK_LEVEL,
     SUPPLIER_COUNT,
-    rn
+    RN
 FROM (
     SELECT
         src.PART_NUMBER,
         src.PART_NAME,
-        src.MANUFACTURER,
-        src.WEIGHT_KG,
+        -- BR-06 / FR-05: store MANUFACTURER in uppercase
+        UPPER(src.MANUFACTURER)                                   AS MANUFACTURER,
+        -- BR-07 / FR-06: replace weight <= 0 with -1
+        IFF(src.WEIGHT_KG <= 0, -1, src.WEIGHT_KG)               AS WEIGHT_KG,
         src.UNIT_PRICE_USD,
         src.CERTIFICATION_STATUS,
         src.LEAD_TIME_DAYS,
@@ -89,19 +89,17 @@ FROM (
         src.SUPPLY_RISK_LEVEL,
         src.SUPPLIER_COUNT,
         -- BR-03: deduplicate by PART_NUMBER, keep latest UPDATED_AT
+        -- NOTE: NO watermark filter here; the view returns ALL source rows
+        -- (deduplicated). The pipeline procedure applies the watermark
+        -- filter itself when reading this view for the incremental extract.
+        -- This allows the soft-delete step to compare against the full
+        -- current source keyset (BR-05).
         ROW_NUMBER() OVER (
             PARTITION BY src.PART_NUMBER
             ORDER BY src.UPDATED_AT DESC NULLS LAST
-        ) AS rn
-    FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE_DEV_SRC src
-    -- Cross-join to singleton watermark param table (BR-01, BR-02)
-    CROSS JOIN SDLC_DB.SDLC_PIPELINES.PIPELINE_WATERMARK_PARAM wm
+        ) AS RN
+    FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE src
     WHERE src.PART_NUMBER IS NOT NULL
-      -- BR-01: incremental filter; BR-02: NULL watermark = full load
-      AND (
-            wm.WATERMARK_TS IS NULL
-            OR src.UPDATED_AT > wm.WATERMARK_TS
-          )
 )
--- BR-03: retain only the latest record per PART_NUMBER
-WHERE rn = 1;
+-- BR-03: retain only the single latest record per PART_NUMBER
+WHERE RN = 1;
