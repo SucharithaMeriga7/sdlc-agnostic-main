@@ -6,20 +6,20 @@
 -- Reuse Route   : PIPELINE
 -- Description   : Schedules SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE
 -- Author        : Sucharitha
--- Created Date  : 2026-11-14
+-- Created Date  : 2026-11-16
 -- Dependencies  :
 --   - SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE
--- Business Rules: BR-01, BR-02, BR-03, BR-04, BR-05, BR-06, BR-07, BR-08, BR-09, BR-10, BR-11, BR-12
+-- Business Rules: BR-01, BR-02, BR-03, BR-04, BR-05, BR-06, BR-07, BR-08, BR-09, BR-10
 -- Change History:
---   2026-11-14  Sucharitha  SCRUM-159  Initial generation (PIPELINE)
+--   2026-11-16  Sucharitha  SCRUM-159  Initial generation (PIPELINE)
 -- =============================================================================
 
--- Scheduled orchestration of SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE (as stated in the MOM (0 5 * * * UTC)).
+-- Scheduled orchestration of SDLC_DB.SDLC_PIPELINES.SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE (as stated in the MOM (0 3 * * * UTC)).
 -- Created SUSPENDED; resume after the validation pack passes:
 --   ALTER TASK SDLC_DB.SDLC_PIPELINES.TASK_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE RESUME;
 CREATE OR REPLACE TASK SDLC_DB.SDLC_PIPELINES.TASK_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE
   WAREHOUSE = SNOWFLAKE_LEARNING_WH
-  SCHEDULE = 'USING CRON 0 5 * * * UTC'
+  SCHEDULE = 'USING CRON 0 3 * * * UTC'
   USER_TASK_TIMEOUT_MS = 3600000
   COMMENT = 'SCRUM-159 - runs the delivery pipeline'
 AS
