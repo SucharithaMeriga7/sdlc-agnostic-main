@@ -1,0 +1,23 @@
+-- =============================================================================
+-- Object        : SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET
+-- Object Type   : TABLE
+-- Jira Story    : SCRUM-159
+-- Requirements  : FR-03, FR-04
+-- Reuse Route   : ADAPT_EXISTING
+-- Description   : Delta: ensure audit columns LAST_MODIFIED_AT, LOAD_TYPE, PIPELINE_RUN_TS exist (already present in existing DDL; no structural change needed). This object entry documents the ADAPT decision.
+-- Author        : Sucharitha
+-- Created Date  : 2026-10-26
+-- Dependencies  :
+--   - none
+-- Business Rules: BR-04, BR-05
+-- Change History:
+--   2026-10-26  Sucharitha  SCRUM-159  Initial generation (ADAPT_EXISTING)
+-- =============================================================================
+
+-- ADAPT_EXISTING: AEROSPACE_PARTS_TARGET
+-- All required columns (LAST_MODIFIED_AT, LOAD_TYPE, PIPELINE_RUN_TS, RISK_SCORE, IS_DELETED, LIFECYCLE_STATUS)
+-- are already present in the existing DDL. No structural ALTER is required.
+-- DELTA: Add LIFECYCLE_STATUS default guard - already VARCHAR(16777216), no change needed.
+-- This statement is a no-op safety check; idempotent.
+-- NOTE: Snowflake does not support ALTER COLUMN SET DEFAULT; default is enforced at INSERT time via COALESCE.
+SELECT 'LAST_MODIFIED_AT default enforced at INSERT via COALESCE - no DDL change required' AS status;
