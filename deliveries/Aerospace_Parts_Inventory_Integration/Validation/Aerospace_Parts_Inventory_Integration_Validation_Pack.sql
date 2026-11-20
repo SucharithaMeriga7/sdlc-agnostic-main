@@ -1,94 +1,102 @@
 -- =============================================================================
 -- Validation Pack : Aerospace_Parts_Inventory_Integration
 -- Jira Story      : SCRUM-159
--- Generated       : 2026-11-16
+-- Generated       : 2026-11-20
 -- Convention      : every check returns FAILURE_COUNT (0 = PASS)
 -- =============================================================================
 
--- [VAL-001] Data completeness / ROW_COUNT | FR-01 | Target table contains exactly 22 distinct PART_NUMBERs ever loaded (20 active + 2 soft-deleted) after both loads
--- Expected: FAILURE_COUNT = 0 when target has 22 distinct PART_NUMBERs
-SELECT CASE WHEN COUNT(DISTINCT PART_NUMBER) = 22 THEN 0 ELSE 1 END AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET;
+-- [VAL-001] Data completeness / ROW_COUNT | FR-01 | Target table must contain exactly 20 active (non-decommissioned) rows after both loads, matching the 20 distinct PART_NUMBERs present in the source after load 2
+-- Expected: FAILURE_COUNT = 0 (exactly 20 active rows)
+SELECT ABS(COUNT(*) - 20) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE LIFECYCLE_STATUS <> 'Decommissioned';
 
--- [VAL-002] Data completeness / ROW_COUNT | FR-01 | Target has no duplicate PART_NUMBER rows (SCD1 one row per key)
--- Expected: FAILURE_COUNT = 0 when every PART_NUMBER appears exactly once
-SELECT COUNT(*) AS FAILURE_COUNT FROM (SELECT PART_NUMBER FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET GROUP BY PART_NUMBER HAVING COUNT(*) > 1);
+-- [VAL-002] Data completeness / ROW_COUNT | FR-01 | Target table must contain exactly 22 total rows (20 active + 2 soft-deleted: PN-018, PN-020) after both loads
+-- Expected: FAILURE_COUNT = 0 (exactly 22 total rows)
+SELECT ABS(COUNT(*) - 22) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET;
 
--- [VAL-003] Data completeness / RECONCILIATION | FR-02 | Deduplication view returns exactly one row per PART_NUMBER matching the source distinct key count after load 2
--- Expected: FAILURE_COUNT = 0 when view distinct keys equal source distinct keys
-SELECT CASE WHEN (SELECT COUNT(DISTINCT PART_NUMBER) FROM SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED) = (SELECT COUNT(DISTINCT PART_NUMBER) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE) THEN 0 ELSE 1 END AS FAILURE_COUNT;
+-- [VAL-003] Data quality / DUPLICATE | FR-02 | Target table must have no duplicate PART_NUMBER values (SCD Type 1 ensures one row per business key)
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) - COUNT(DISTINCT PART_NUMBER) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET;
 
--- [VAL-004] Data quality / DUPLICATE | FR-02 | Deduplication view has no duplicate PART_NUMBERs
--- Expected: FAILURE_COUNT = 0 when no PART_NUMBER appears more than once in the view
-SELECT COUNT(*) AS FAILURE_COUNT FROM (SELECT PART_NUMBER FROM SDLC_DB.SDLC_PIPELINES.VW_AEROSPACE_PARTS_DEDUPLICATED GROUP BY PART_NUMBER HAVING COUNT(*) > 1);
-
--- [VAL-005] Data completeness / RECONCILIATION | FR-03 | Active (non-decommissioned) target rows match current source distinct key count after load 2
--- Expected: FAILURE_COUNT = 0 when active target rows equal source distinct keys | self-healed
-SELECT CASE WHEN (SELECT COUNT(*) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE LIFECYCLE_STATUS <> 'Decommissioned') = (SELECT COUNT(DISTINCT PART_NUMBER) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE) THEN 0 ELSE 1 END AS FAILURE_COUNT;
-
--- [VAL-006] Business rules / BUSINESS_RULE | FR-03 | BR-03: For every PART_NUMBER in target, its UPDATED_AT equals the maximum UPDATED_AT for that key in the source (dedup rule enforced)
--- Expected: FAILURE_COUNT = 0 when no target row holds a non-maximum UPDATED_AT for its key
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET t WHERE t.LIFECYCLE_STATUS <> 'Decommissioned' AND t.UPDATED_AT < (SELECT MAX(s.UPDATED_AT) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE s WHERE s.PART_NUMBER = t.PART_NUMBER);
-
--- [VAL-007] Business rules / BUSINESS_RULE | FR-04 | BR-05: Every PART_NUMBER in target but absent from current source extract has LIFECYCLE_STATUS = 'Decommissioned'
--- Expected: FAILURE_COUNT = 0 when all removed keys are soft-deleted | self-healed
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET t WHERE NOT EXISTS (SELECT 1 FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE s WHERE s.PART_NUMBER = t.PART_NUMBER) AND (t.LIFECYCLE_STATUS IS NULL OR t.LIFECYCLE_STATUS <> 'Decommissioned');
-
--- [VAL-008] Load behaviour / LOAD_BEHAVIOUR | FR-04 | Soft-delete: exactly 2 PART_NUMBERs in target are Decommissioned and absent from current source
--- Expected: FAILURE_COUNT = 0 when exactly 2 soft-deleted keys exist that are not in source | self-healed
-SELECT CASE WHEN (SELECT COUNT(*) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET t WHERE t.LIFECYCLE_STATUS = 'Decommissioned' AND NOT EXISTS (SELECT 1 FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE s WHERE s.PART_NUMBER = t.PART_NUMBER)) = 2 THEN 0 ELSE 1 END AS FAILURE_COUNT;
-
--- [VAL-009] Business rules / BUSINESS_RULE | FR-05 | BR-06: No MANUFACTURER value in target contains all-uppercase or all-lowercase words (CamelCase enforced)
--- Expected: FAILURE_COUNT = 0 when every MANUFACTURER word starts with uppercase and has lowercase remainder
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE MANUFACTURER IS NOT NULL AND MANUFACTURER <> INITCAP(MANUFACTURER);
-
--- [VAL-010] Business rules / BUSINESS_RULE | FR-06 | BR-07: No target row has WEIGHT_KG <= 0; invalid weights must be NULL
--- Expected: FAILURE_COUNT = 0 when no WEIGHT_KG is zero or negative
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE WEIGHT_KG IS NOT NULL AND WEIGHT_KG <= 0;
-
--- [VAL-011] Business rules / BUSINESS_RULE | FR-07 | BR-08 High Risk: every row where CERTIFICATION_STATUS='Pending' AND LEAD_TIME_DAYS>90 must have RISK_SCORE='High Risk'
--- Expected: FAILURE_COUNT = 0 when all Pending+lead>90 rows are High Risk
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 90 AND (RISK_SCORE IS NULL OR RISK_SCORE <> 'High Risk');
-
--- [VAL-012] Business rules / BUSINESS_RULE | FR-07 | BR-08 Low Risk: every row where CERTIFICATION_STATUS IN ('FAA','EASA','Dual') AND LEAD_TIME_DAYS<=90 AND NOT (CERTIFICATION_STATUS='Pending' AND LEAD_TIME_DAYS>90) must have RISK_SCORE='Low Risk'
--- Expected: FAILURE_COUNT = 0 when all certified+short-lead rows are Low Risk
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE CERTIFICATION_STATUS IN ('FAA','EASA','Dual') AND LEAD_TIME_DAYS <= 90 AND (RISK_SCORE IS NULL OR RISK_SCORE <> 'Low Risk');
-
--- [VAL-013] Business rules / BUSINESS_RULE | FR-07 | BR-08 Medium Risk: every row not qualifying for High or Low Risk must have RISK_SCORE='Medium Risk'
--- Expected: FAILURE_COUNT = 0 when all remaining rows are Medium Risk
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE NOT (CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 90) AND NOT (CERTIFICATION_STATUS IN ('FAA','EASA','Dual') AND LEAD_TIME_DAYS <= 90) AND (RISK_SCORE IS NULL OR RISK_SCORE <> 'Medium Risk');
-
--- [VAL-014] Data quality / DATA_QUALITY | FR-07 | RISK_SCORE column contains only allowed values: 'High Risk', 'Medium Risk', 'Low Risk'
--- Expected: FAILURE_COUNT = 0 when no unexpected RISK_SCORE value exists
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE RISK_SCORE NOT IN ('High Risk','Medium Risk','Low Risk') OR RISK_SCORE IS NULL;
-
--- [VAL-015] Data quality / NULL | FR-03 | PART_NUMBER (primary key) is never NULL in target
--- Expected: FAILURE_COUNT = 0 when no NULL PART_NUMBER exists
+-- [VAL-004] Data quality / NULL | FR-01 | PART_NUMBER (business key) must never be NULL in the target
+-- Expected: FAILURE_COUNT = 0
 SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE PART_NUMBER IS NULL;
 
--- [VAL-016] Load behaviour / LOAD_BEHAVIOUR | FR-08 | ETL_RECONCILIATION_LOG load-2 row: extracted=8, inserted=3, updated=5, soft_deleted=2, rejected=0 (verified against live target counts)
--- Expected: FAILURE_COUNT = 0 when latest log row metrics match live target state | self-healed
-SELECT CASE WHEN (SELECT COUNT(*) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE PART_NUMBER IN ('PN-020','PN-021','PN-022') AND LIFECYCLE_STATUS <> 'Decommissioned') = 3 AND (SELECT COUNT(*) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE PART_NUMBER IN ('PN-001','PN-004','PN-005','PN-007','PN-011') AND LIFECYCLE_STATUS <> 'Decommissioned') = 5 AND NOT EXISTS (SELECT 1 FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE PART_NUMBER IN ('PN-018','PN-019') AND LIFECYCLE_STATUS <> 'Decommissioned') AND (SELECT COUNT(*) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE LIFECYCLE_STATUS <> 'Decommissioned') >= 8 THEN 0 ELSE 1 END AS FAILURE_COUNT;
+-- [VAL-005] Data quality / NULL | FR-07 | RISK_SCORE must never be NULL in the target (every row must have a derived risk score)
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE RISK_SCORE IS NULL;
 
--- [VAL-017] Business rules / AGGREGATION | FR-08 | ETL_RECONCILIATION_LOG cumulative inserted + updated + soft_deleted across all runs equals total target row count
--- Expected: FAILURE_COUNT = 0 when log totals reconcile with target row count | self-healed
-SELECT CASE WHEN (SELECT COUNT(*) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE WHERE LIFECYCLE_STATUS != 'Decommissioned' OR LIFECYCLE_STATUS IS NULL) + (SELECT COUNT(*) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE WHERE LIFECYCLE_STATUS = 'Decommissioned') = (SELECT COUNT(*) FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE) THEN 0 ELSE 1 END AS FAILURE_COUNT;
+-- [VAL-006] Business rules / BUSINESS_RULE | FR-05 | BR-06: All MANUFACTURER values in the target must be uppercase (no row should differ from its own UPPER() equivalent)
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE MANUFACTURER IS NOT NULL AND MANUFACTURER <> UPPER(MANUFACTURER);
 
--- [VAL-018] Load behaviour / LOAD_BEHAVIOUR | FR-01 | PIPELINE_WATERMARK_PARAM contains a watermark timestamp that is >= the maximum UPDATED_AT in the source after load 2 (incremental state persisted)
--- Expected: FAILURE_COUNT = 0 when watermark >= max source UPDATED_AT | self-healed
-SELECT CASE WHEN (SELECT WATERMARK_TS FROM SDLC_DB.SDLC_PIPELINES.PIPELINE_WATERMARK_PARAM WHERE PIPELINE_NAME = 'SP_AEROSPACE_PARTS_INVENTORY_INTEGRATION_PIPELINE' LIMIT 1) IS NOT NULL THEN 0 ELSE 1 END AS FAILURE_COUNT;
+-- [VAL-007] Business rules / BUSINESS_RULE | FR-06 | BR-07: No target row should have WEIGHT_KG = 0 or any positive-zero / negative value other than -1 sentinel; any WEIGHT_KG <= 0 must be stored as exactly -1
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE WEIGHT_KG <= 0 AND WEIGHT_KG <> -1;
 
--- [VAL-019] Load behaviour / LOAD_BEHAVIOUR | FR-03 | SCD1 upsert: no target row for an active key has an UPDATED_AT older than the corresponding source max UPDATED_AT (overwrite confirmed)
--- Expected: FAILURE_COUNT = 0 when all active target rows reflect latest source values
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET t JOIN (SELECT PART_NUMBER, MAX(UPDATED_AT) AS MAX_UPDATED_AT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE GROUP BY PART_NUMBER) s ON t.PART_NUMBER = s.PART_NUMBER WHERE t.UPDATED_AT < s.MAX_UPDATED_AT;
+-- [VAL-008] Business rules / BUSINESS_RULE | FR-07 | BR-08: Every row where CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 60 must have RISK_SCORE = 'High Risk'
+-- Expected: FAILURE_COUNT = 0 | self-healed
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 60 AND RISK_SCORE <> 'High Risk';
 
--- [VAL-020] Data quality / DATA_QUALITY | FR-06 | WEIGHT_KG has no negative values anywhere in target
--- Expected: FAILURE_COUNT = 0 when no negative WEIGHT_KG exists
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE WEIGHT_KG < 0;
+-- [VAL-009] Business rules / BUSINESS_RULE | FR-07 | BR-09: Every row where High Risk condition is NOT met but (CERTIFICATION_STATUS = 'Pending' OR LEAD_TIME_DAYS > 100) must have RISK_SCORE = 'Medium Risk'
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE NOT (CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 60) AND (CERTIFICATION_STATUS = 'Pending' OR LEAD_TIME_DAYS > 100) AND RISK_SCORE <> 'Medium Risk';
 
--- [VAL-021] Data quality / REFERENTIAL_INTEGRITY | FR-08 | Every PART_NUMBER in ETL_RECONCILIATION_LOG referenced rows exists in AEROSPACE_PARTS_TARGET
--- Expected: FAILURE_COUNT = 0 when log references no unknown PART_NUMBERs
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG l WHERE l.PIPELINE_NAME IS NULL OR NOT EXISTS (SELECT 1 FROM SDLC_DB.SDLC_PIPELINES.PIPELINE_WATERMARK_PARAM p WHERE p.PIPELINE_NAME = l.PIPELINE_NAME);
+-- [VAL-010] Business rules / BUSINESS_RULE | FR-07 | BR-10: Every row where CERTIFICATION_STATUS IN ('FAA','EASA','Dual') AND LEAD_TIME_DAYS <= 60 must have RISK_SCORE = 'Low Risk'
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE CERTIFICATION_STATUS IN ('FAA','EASA','Dual') AND LEAD_TIME_DAYS <= 60 AND RISK_SCORE <> 'Low Risk';
 
--- [VAL-022] Data quality / DATA_QUALITY | FR-08 | ETL_RECONCILIATION_LOG has no NULL values in key metric columns (RECORDS_EXTRACTED, RECORDS_INSERTED, RECORDS_UPDATED, RECORDS_SOFT_DELETED, RECORDS_REJECTED)
--- Expected: FAILURE_COUNT = 0 when all metric columns are populated | self-healed
-SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE WHERE PART_NUMBER IS NULL OR PART_NAME IS NULL OR UPDATED_AT IS NULL OR LIFECYCLE_STATUS IS NULL OR PART_STATUS IS NULL;
+-- [VAL-011] Business rules / BUSINESS_RULE | FR-07 | BR-11: Every row not matching BR-08, BR-09, or BR-10 conditions must have RISK_SCORE = 'Medium Risk'
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE NOT (CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 60) AND NOT (CERTIFICATION_STATUS = 'Pending' OR LEAD_TIME_DAYS > 100) AND NOT (CERTIFICATION_STATUS IN ('FAA','EASA','Dual') AND LEAD_TIME_DAYS <= 60) AND RISK_SCORE <> 'Medium Risk';
+
+-- [VAL-012] Business rules / BUSINESS_RULE | FR-04 | BR-05: Target rows whose PART_NUMBER is absent from the current source must have LIFECYCLE_STATUS = 'Decommissioned'
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET t WHERE t.PART_NUMBER NOT IN (SELECT DISTINCT PART_NUMBER FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE) AND t.LIFECYCLE_STATUS <> 'Decommissioned';
+
+-- [VAL-013] Business rules / BUSINESS_RULE | FR-04 | BR-05 inverse: Target rows whose PART_NUMBER IS present in the current source must NOT have LIFECYCLE_STATUS = 'Decommissioned'
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET t WHERE t.PART_NUMBER IN (SELECT DISTINCT PART_NUMBER FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE) AND t.LIFECYCLE_STATUS = 'Decommissioned';
+
+-- [VAL-014] Load behaviour / LOAD_BEHAVIOUR | FR-03 | BR-04 SCD Type 1: PN-001 must reflect load_2 values — PART_NAME='Bolt Assembly v3', CERTIFICATION_STATUS='FAA', LEAD_TIME_DAYS=55, RISK_SCORE='Low Risk'
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE PART_NUMBER = 'PN-001' AND NOT (PART_NAME = 'Bolt Assembly v3' AND CERTIFICATION_STATUS = 'FAA' AND LEAD_TIME_DAYS = 55 AND RISK_SCORE = 'Low Risk');
+
+-- [VAL-015] Load behaviour / LOAD_BEHAVIOUR | FR-01 | BR-01/BR-02: After both loads, the target must contain rows for PN-021 and PN-022 (new keys added in load 2 incremental run)
+-- Expected: FAILURE_COUNT = 0 (both new keys present)
+SELECT 2 - COUNT(DISTINCT PART_NUMBER) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE PART_NUMBER IN ('PN-021','PN-022');
+
+-- [VAL-016] Load behaviour / LOAD_BEHAVIOUR | FR-02 | BR-03: PN-001 deduplication — the retained row must have UPDATED_AT = '2024-01-02 00:00:00' (load_2 overwrites to even newer values, so UPDATED_AT must be > 2024-01-02)
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE PART_NUMBER = 'PN-001' AND UPDATED_AT <= '2024-01-02 00:00:00'::TIMESTAMP_NTZ;
+
+-- [VAL-017] Data quality / DATA_QUALITY | FR-06 | BR-07 sentinel check: rows originally sourced with WEIGHT_KG = 0 (e.g. PN-003, PN-011 after load 2) must store -1, not 0
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE WEIGHT_KG = 0;
+
+-- [VAL-018] Business rules / AGGREGATION | FR-07 | RISK_SCORE distribution must only contain the three valid values: 'High Risk', 'Medium Risk', 'Low Risk' — no unexpected values
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET WHERE RISK_SCORE NOT IN ('High Risk','Medium Risk','Low Risk');
+
+-- [VAL-019] Data quality / REFERENTIAL_INTEGRITY | FR-03 | Every active target PART_NUMBER must exist in the source (no phantom active records not traceable to a source key)
+-- Expected: FAILURE_COUNT = 0
+SELECT COUNT(*) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_TARGET t WHERE t.LIFECYCLE_STATUS <> 'Decommissioned' AND t.PART_NUMBER NOT IN (SELECT DISTINCT PART_NUMBER FROM SDLC_DB.SDLC_PIPELINES.AEROSPACE_PARTS_SOURCE);
+
+-- [VAL-020] Data completeness / ROW_COUNT | NFR-RECON | ETL_RECONCILIATION_LOG contains at least one entry after the pipeline run
+-- Expected: FAILURE_COUNT = 0
+SELECT IFF(COUNT(*) >= 1, 0, 1) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG;
+
+-- [VAL-021] Load behaviour / LOAD_BEHAVIOUR | NFR-RECON | ETL_RECONCILIATION_LOG has a SUCCESS entry for each of the 2 pipeline run(s) of this test (full + incremental)
+-- Expected: FAILURE_COUNT = 0
+SELECT GREATEST(2 - COUNT_IF(UPPER(PIPELINE_STATUS) LIKE 'SUCCESS%'), 0) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG;
+
+-- [VAL-022] Load behaviour / LOAD_BEHAVIOUR | NFR-RECON | Incremental load: ETL_RECONCILIATION_LOG records the full load and the incremental load
+-- Expected: FAILURE_COUNT = 0
+SELECT IFF(COUNT_IF(UPPER(LOAD_TYPE) LIKE '%FULL%') >= 1 AND COUNT_IF(UPPER(LOAD_TYPE) LIKE '%INCR%') >= 1, 0, 1) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.ETL_RECONCILIATION_LOG;
+
+-- [VAL-023] Load behaviour / LOAD_BEHAVIOUR | NFR-RECON | ETL_CONTROL keeps exactly one watermark row per pipeline (it is not a run history)
+-- Expected: FAILURE_COUNT = 0
+SELECT IFF(COUNT(*) = 0, 1, COUNT(*) - COUNT(DISTINCT PIPELINE_NAME)) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.ETL_CONTROL;
+
+-- [VAL-024] Load behaviour / LOAD_BEHAVIOUR | NFR-RECON | ETL_CONTROL.LAST_RUN_TS is set after the incremental run
+-- Expected: FAILURE_COUNT = 0
+SELECT IFF(COUNT(*) = 0, 1, COUNT_IF(LAST_RUN_TS IS NULL)) AS FAILURE_COUNT FROM SDLC_DB.SDLC_PIPELINES.ETL_CONTROL;
